@@ -2,6 +2,7 @@
 
 TL;DR: A multi-modular, mult-platform bridging bot for shitposters &amp; niche communities alike!  
 
+About the project:
 This have been a project of mine for the past year; but since the great (upcoming) fall of Discord in the Spring of 2026, i've been seeing a lot of the new platforms pop up from thin air, confusing people as to where to go instead of actually helping them migrate. It started as a simple, two-way Telegram <--> Discord bridge i've made because all other opensource projects sucked - could not even download from Discord's CDN properly.
 So after the massive revamp i've done in February 2026, this project aims to be a migration tool for a large variety of communities - niche chatrooms, art channels, and, of course - shitposting. 
 All battle tested in the REDAFT community (t.me/the_redaft)
