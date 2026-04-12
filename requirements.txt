@@ -1,0 +1,28 @@
+# CHATAFT Bridge - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# RabbitMQ client
+pika
+
+# Platform SDKs
+python-telegram-bot
+discord.py
+stoat.py
+mautrix
+
+# Async HTTP (webhooks, avatar downloads, API calls)
+aiohttp
+
+# Image processing (Telegram media)
+Pillow
+
+# Arbiter dashboard
+rich
+
+# Colored console logging
+colorama
+
+# file processing 
+gifsicle # (optional)
+ffmpeg
+ffprobe
