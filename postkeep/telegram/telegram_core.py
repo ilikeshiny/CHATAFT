@@ -13,16 +13,17 @@ _root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from telegram import Bot
+from telegram import Bot, BotCommand
 from telegram.ext import ApplicationBuilder
 
 from postkeep.papyrus import (
-    ARBITER_QUEUES, apply_namespace, get_namespace, log_info, 
+    ARBITER_QUEUES, apply_namespace, get_namespace, log_info,
     log_error, log_warn, log_success, log_debug,
     load_global_settings,
     BridgeDatabase, StatusUpdate, CONFIG_FILE,
     get_avatar_db, CITADEL_ROOT,
     GatewayConfig, load_all_gateways,
+    refresh_global_privacy_limit, is_privacy_active,
 )
 
 CODEX_FILE = os.path.join(_root, 'codex.ini')
@@ -50,7 +51,35 @@ class TelegramCore:
             log_info(f"Initialized database for {name}: {db_path}")
 
         self.bot = Bot(token=self.settings['TELEGRAM_BOT_TOKEN'])
-        self.app = ApplicationBuilder().token(self.settings['TELEGRAM_BOT_TOKEN']).build()
+
+        # Cache: is privacy reachable on any bridge? Drives whether we register
+        # /privacy with BotFather and run any per-message privacy checks.
+        # Refreshed by reload_config().
+        self._privacy_active = is_privacy_active(self.bridges)
+
+        privacy_active_at_startup = self._privacy_active
+
+        async def _post_init(application):
+            try:
+                if privacy_active_at_startup:
+                    await application.bot.set_my_commands([
+                        BotCommand('privacy', 'Set your message privacy level'),
+                    ])
+                    log_info("Registered Telegram bot commands (/privacy).")
+                else:
+                    # Clear any previously-registered commands so /privacy
+                    # doesn't linger in BotFather's command menu.
+                    await application.bot.set_my_commands([])
+                    log_info("Privacy fully disabled; cleared Telegram bot commands.")
+            except Exception as e:
+                log_warn(f"set_my_commands failed: {e}")
+
+        self.app = (
+            ApplicationBuilder()
+            .token(self.settings['TELEGRAM_BOT_TOKEN'])
+            .post_init(_post_init)
+            .build()
+        )
 
         self._namespace = get_namespace() or str(self.settings.get('QUEUE_NAMESPACE', '')).strip()
         self._queues_namespaced = False
@@ -152,6 +181,16 @@ class TelegramCore:
 
             self.settings = new_settings
             self.bridges = new_bridges
+            refresh_global_privacy_limit()
+            # Re-evaluate active flag: per-bridge overrides may have changed.
+            # Note: handler registration is startup-only, but updating this
+            # flag stops any per-message privacy checks at runtime.
+            self._privacy_active = is_privacy_active(self.bridges)
+            try:
+                if hasattr(self, 'scribe') and self.scribe is not None:
+                    self.scribe._privacy_active = self._privacy_active
+            except Exception:
+                pass
             log_success('Telegram config reloaded')
         except Exception as e:
             log_error(f"Failed to reload Telegram config: {e}")

@@ -32,14 +32,44 @@ if sys.platform == 'win32':
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 CITADEL_ROOT = os.path.join(PROJECT_ROOT, 'citadel')
+CITADEL_GLOBAL_ROOT = os.path.join(CITADEL_ROOT, '_global')
 CODEX_FILE = os.path.join(PROJECT_ROOT, 'codex.ini')
 LEGACY_CONFIG_FILE = os.path.join(PROJECT_ROOT, 'config.ini')
 CONFIG_FILE = CODEX_FILE if os.path.exists(CODEX_FILE) else LEGACY_CONFIG_FILE
 
-IGNORED_USERS_FILE = os.path.join(PROJECT_ROOT, 'ignored_users.txt')
-ADMINS_FILE = os.path.join(PROJECT_ROOT, 'admins.txt')
-DOWNLOAD_DOMAINS_FILE = os.path.join(PROJECT_ROOT, 'download_domains.txt')
-IGNORED_DOMAINS_FILE = os.path.join(PROJECT_ROOT, 'ignored_domains.txt')
+# Ensure the global state directory exists (lazy-created files live here).
+try:
+    os.makedirs(CITADEL_GLOBAL_ROOT, exist_ok=True)
+except Exception:
+    pass
+
+# Legacy locations (project root) - used as fallback for migration if present.
+_LEGACY_IGNORED_USERS_FILE = os.path.join(PROJECT_ROOT, 'ignored_users.txt')
+_LEGACY_ADMINS_FILE = os.path.join(PROJECT_ROOT, 'admins.txt')
+_LEGACY_DOWNLOAD_DOMAINS_FILE = os.path.join(PROJECT_ROOT, 'download_domains.txt')
+_LEGACY_IGNORED_DOMAINS_FILE = os.path.join(PROJECT_ROOT, 'ignored_domains.txt')
+
+def _resolve_global_state(name: str, legacy_path: str) -> str:
+    """Prefer citadel/_global/<name>; fall back to legacy root path if it
+    exists and the new file does not (one-time auto-migration)."""
+    new_path = os.path.join(CITADEL_GLOBAL_ROOT, name)
+    if not os.path.exists(new_path) and os.path.exists(legacy_path):
+        try:
+            with open(legacy_path, 'rb') as src, open(new_path, 'wb') as dst:
+                dst.write(src.read())
+        except Exception:
+            return legacy_path
+    return new_path
+
+IGNORED_USERS_FILE = _resolve_global_state('ignored_users.txt', _LEGACY_IGNORED_USERS_FILE)
+ADMINS_FILE = _resolve_global_state('admins.txt', _LEGACY_ADMINS_FILE)
+DOWNLOAD_DOMAINS_FILE = _resolve_global_state('download_domains.txt', _LEGACY_DOWNLOAD_DOMAINS_FILE)
+IGNORED_DOMAINS_FILE = _resolve_global_state('ignored_domains.txt', _LEGACY_IGNORED_DOMAINS_FILE)
+# These previously lived at citadel/<file>; auto-migrate to citadel/_global/<file>.
+PRIVACY_FILE = _resolve_global_state('privacy.txt', os.path.join(CITADEL_ROOT, 'privacy.txt'))
+LINK_REPLACEMENTS_FILE = _resolve_global_state(
+    'link_replacements.txt', os.path.join(CITADEL_ROOT, 'link_replacements.txt')
+)
 
 # ── queue definitions ────────────────────────────────
 
@@ -315,6 +345,17 @@ class PlatformSection:
         self.cross_edit = _gw_bool(data.get('cross_edit'), True)
         self.cross_delete = _gw_bool(data.get('cross_delete'), True)
 
+        # privacy_limit: per-platform cap on max user-settable privacy level.
+        # Falsy/missing = inherit global PRIVACY_LIMIT. 0/1/2 = explicit cap.
+        raw_limit = data.get('privacy_limit', None)
+        if raw_limit is None or str(raw_limit).strip() == '':
+            self.privacy_limit = None
+        else:
+            try:
+                self.privacy_limit = max(0, min(2, int(str(raw_limit).strip())))
+            except Exception:
+                self.privacy_limit = None
+
         self.import_start = (data.get('import_start', '') or '').strip() or None
         self.import_end = (data.get('import_end', '') or '').strip() or None
         self.import_receiver = _gw_bool(data.get('import_receiver'), False)
@@ -350,6 +391,16 @@ class PlatformSection:
             self.webhook_add_channel_in_name = _gw_bool(data.get('webhook_add_channel_in_name'), False)
             self.webhook_forward_in_name = _gw_bool(data.get('webhook_forward_in_name'), False)
             self.webhook_show_forwards = _gw_bool(data.get('webhook_show_forwards'), True)
+
+            # custom_emoji: 0/full=text+image (default), 1/text_only=:name: only,
+            #   2/disabled=strip both
+            raw_emoji = (data.get('custom_emoji', 'full') or 'full').strip().lower()
+            if raw_emoji in ('1', 'text_only', 'text-only', 'text'):
+                self.custom_emoji = 1
+            elif raw_emoji in ('2', 'disabled', 'off', 'false', 'no'):
+                self.custom_emoji = 2
+            else:
+                self.custom_emoji = 0
 
         if platform == 'stoatchat':
             self.use_masquerade = _gw_bool(data.get('use_masquerade'), True)
@@ -519,6 +570,8 @@ def load_global_settings(config_file=None, component=None):
         'RABBITMQ_USER': 'guest',
         'RABBITMQ_PASS': 'guest',
         'QUEUE_NAMESPACE': '',
+        'PRIVACY_LIMIT': 1,
+        'INCOGNITO_AVATAR_BG': 'transparent',
         'DISCORD_SKIP_DOWNLOAD_DOMAINS': [
             'x.com', 'twitter.com', 'fixupx.com', 'vxtwitter.com', 'fxtwitter.com',
         ],
@@ -541,6 +594,8 @@ def load_global_settings(config_file=None, component=None):
             # Matrix - Bot mode
             'MATRIX_BOT_TOKEN':         creds.get('MATRIX_BOT_TOKEN', ''),
             'MATRIX_BOT_USER':          creds.get('MATRIX_BOT_USER', ''),
+            'MATRIX_BOT_USERNAME':      creds.get('MATRIX_BOT_USERNAME', ''),
+            'MATRIX_BOT_PASSWORD':      creds.get('MATRIX_BOT_PASSWORD', ''),
         })
 
     if 'Features' in config:
@@ -565,11 +620,26 @@ def load_global_settings(config_file=None, component=None):
         global_settings['RABBITMQ_PASS'] = features.get('RABBITMQ_PASS', 'guest')
         global_settings['QUEUE_NAMESPACE'] = features.get('QUEUE_NAMESPACE', '')
 
+        if 'PRIVACY_LIMIT' in features:
+            try:
+                lim = int(features.get('PRIVACY_LIMIT', '1'))
+                global_settings['PRIVACY_LIMIT'] = max(0, min(2, lim))
+            except Exception:
+                global_settings['PRIVACY_LIMIT'] = 1
+
+        if 'INCOGNITO_AVATAR_BG' in features:
+            global_settings['INCOGNITO_AVATAR_BG'] = (
+                features.get('INCOGNITO_AVATAR_BG', 'transparent') or 'transparent'
+            ).strip()
+
         log_level = features.get('LOG_LEVEL', 'INFO')
         set_log_level(log_level)
 
         if 'DISCORD_AVATAR_UPLOAD_CHANNEL_ID' in features:
             global_settings['DISCORD_AVATAR_UPLOAD_CHANNEL_ID'] = features.get('DISCORD_AVATAR_UPLOAD_CHANNEL_ID')
+
+        if 'DISCORD_MODE' in features:
+            global_settings['DISCORD_MODE'] = features.get('DISCORD_MODE')
 
         if 'STOATCHAT_AVATAR_UPLOAD_CHANNEL_ID' in features:
             global_settings['STOATCHAT_AVATAR_UPLOAD_CHANNEL_ID'] = features.get('STOATCHAT_AVATAR_UPLOAD_CHANNEL_ID')
@@ -932,27 +1002,61 @@ def should_skip_download(url: str, skip_domains: list = None) -> bool:
         return False
 
 
-def get_file_type_from_url(url: str, filename: str = "") -> str:
-    if filename:
-        ext = filename.lower().split('.')[-1] if '.' in filename else ''
-    else:
-        path = url.split('?')[0]
-        ext = path.lower().split('.')[-1] if '.' in path else ''
+_MIME_MAP = {
+    'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
+    'gif': 'image/gif', 'webp': 'image/webp',
+    'mp4': 'video/mp4', 'webm': 'video/webm',
+    'mov': 'video/quicktime', 'avi': 'video/x-msvideo',
+    'mp3': 'audio/mp3', 'm4a': 'audio/m4a', 'ogg': 'audio/ogg',
+    'wav': 'audio/wav', 'flac': 'audio/flac',
+    'opus': 'audio/ogg', 'oga': 'audio/ogg',
+}
 
-    mime_map = {
-        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-        'gif': 'image/gif', 'webp': 'image/webp',
-        'mp4': 'video/mp4', 'webm': 'video/webm',
-        'mov': 'video/quicktime', 'avi': 'video/x-msvideo',
-        'mp3': 'audio/mp3', 'm4a': 'audio/m4a', 'ogg': 'audio/ogg',
-        'wav': 'audio/wav', 'flac': 'audio/flac',
-        'opus': 'audio/ogg', 'oga': 'audio/ogg',
-    }
-    if ext in mime_map:
-        return mime_map[ext]
-    if any(d in url for d in ['fixupx.com', 'fxtwitter.com']):
+
+def infer_mime_type(filename: str = "", url: str = "", fallback: str = "application/octet-stream") -> str:
+    """Best-effort MIME inference from filename/url. Returns fallback if nothing matches.
+
+    Tries (in order): custom map (authoritative for our common cases), stdlib mimetypes,
+    URL-domain hints, then fallback.
+    """
+    name = filename or ''
+    if not name and url:
+        name = url.split('?')[0]
+    ext = name.lower().rsplit('.', 1)[-1] if '.' in name else ''
+
+    if ext in _MIME_MAP:
+        return _MIME_MAP[ext]
+
+    if name:
+        try:
+            import mimetypes
+            guess, _ = mimetypes.guess_type(name)
+            if guess:
+                return guess
+        except Exception:
+            pass
+
+    if url and any(d in url for d in ['fixupx.com', 'fxtwitter.com']):
         return 'video/mp4'
-    return 'application/octet-stream'
+
+    return fallback
+
+
+def normalize_mime_type(candidate: str, filename: str = "", url: str = "") -> str:
+    """Return `candidate` if it's a real MIME type; otherwise infer from filename/url.
+
+    Treats empty, missing-slash, and 'application/octet-stream' values as unreliable
+    and tries to do better via filename inference. Falls back to octet-stream if all
+    else fails.
+    """
+    c = (candidate or '').strip()
+    if c and '/' in c and c != 'application/octet-stream':
+        return c
+    return infer_mime_type(filename=filename, url=url, fallback='application/octet-stream')
+
+
+def get_file_type_from_url(url: str, filename: str = "") -> str:
+    return infer_mime_type(filename=filename, url=url, fallback='application/octet-stream')
 
 
 def extract_ignore_hint_urls(text: str) -> List[str]:
@@ -1016,6 +1120,361 @@ def is_user_ignored(platform: str, user_id) -> bool:
 def is_user_admin(platform: str, user_id) -> bool:
     key = f"{platform.lower()}:{user_id}"
     return key in _read_line_file(ADMINS_FILE)
+
+
+# ── privacy ───────────────────────────────────────────
+# privacy.txt format:  platform:user_id:scope:level
+#   scope = channel_id (per-bridge) or "all" (everywhere)
+#   level = 0 (disabled), 1 (omit nickname), 2 (fully ignore)
+# Channel-specific entry takes precedence over "all"; missing = level 0.
+
+_GLOBAL_PRIVACY_LIMIT_CACHE = None
+
+
+def _cached_global_privacy_limit() -> int:
+    global _GLOBAL_PRIVACY_LIMIT_CACHE
+    if _GLOBAL_PRIVACY_LIMIT_CACHE is None:
+        try:
+            settings = load_global_settings()
+            _GLOBAL_PRIVACY_LIMIT_CACHE = int(settings.get('PRIVACY_LIMIT', 1))
+        except Exception:
+            _GLOBAL_PRIVACY_LIMIT_CACHE = 1
+    return _GLOBAL_PRIVACY_LIMIT_CACHE
+
+
+def refresh_global_privacy_limit():
+    """Invalidate the cached global PRIVACY_LIMIT. Call from core.reload_config()."""
+    global _GLOBAL_PRIVACY_LIMIT_CACHE
+    _GLOBAL_PRIVACY_LIMIT_CACHE = None
+
+
+def is_privacy_active(bridges) -> bool:
+    """True if privacy is reachable anywhere: global cap > 0, OR any bridge has
+    an explicit per-platform `privacy_limit > 0` override.
+    When False, scribes/cores can skip registering privacy commands and skip
+    every per-message privacy check entirely - zero overhead.
+    """
+    if _cached_global_privacy_limit() > 0:
+        return True
+    if not bridges:
+        return False
+    for bridge in bridges.values():
+        for plat in ('telegram', 'discord', 'stoatchat', 'matrix'):
+            section = bridge.get_platform(plat) if hasattr(bridge, 'get_platform') else None
+            if section is None:
+                continue
+            lim = getattr(section, 'privacy_limit', None)
+            if lim is not None and lim > 0:
+                return True
+    return False
+
+
+def get_privacy_limit(platform: str = None, bridge: 'GatewayConfig' = None) -> int:
+    """Effective max privacy level a user may select.
+    Per-platform override (gateway.ini) > global PRIVACY_LIMIT (codex.ini) > 1.
+    """
+    if bridge is not None and platform:
+        section = bridge.get_platform(platform)
+        if section is not None and getattr(section, 'privacy_limit', None) is not None:
+            return int(section.privacy_limit)
+    return _cached_global_privacy_limit()
+
+
+_PRIVACY_LEVEL_LABELS = {0: 'disabled', 1: 'omit nickname', 2: 'fully ignore'}
+
+
+def format_privacy_levels_token(limit: int) -> str:
+    """Pipe-separated valid-level token for usage strings, e.g. '0|1' or '0|1|2'."""
+    return '|'.join(str(i) for i in range(0, max(0, min(2, int(limit))) + 1))
+
+
+def format_privacy_levels_help(limit: int) -> str:
+    """Human-readable per-level legend filtered to the effective cap.
+    e.g. limit=1 -> '0=disabled, 1=omit nickname'."""
+    lim = max(0, min(2, int(limit)))
+    return ', '.join(f"{i}={_PRIVACY_LEVEL_LABELS[i]}" for i in range(0, lim + 1))
+
+
+def format_privacy_levels_phrase(limit: int) -> str:
+    """For error text. limit=0 -> '0', limit=1 -> '0 or 1', limit=2 -> '0, 1, or 2'."""
+    lim = max(0, min(2, int(limit)))
+    if lim == 0:
+        return '0'
+    if lim == 1:
+        return '0 or 1'
+    return '0, 1, or 2'
+
+
+def cap_privacy_level(level: int, platform: str = None, bridge: 'GatewayConfig' = None) -> int:
+    """Clamp a stored/requested level by the effective privacy_limit."""
+    try:
+        lvl = int(level)
+    except Exception:
+        return 0
+    if lvl < 0:
+        return 0
+    return min(lvl, get_privacy_limit(platform, bridge))
+
+
+def get_privacy_level(platform: str, user_id, channel_id=None, bridge=None) -> int:
+    # Fast path: if effective cap is 0, privacy is force-disabled here.
+    # Skip privacy.txt I/O entirely - this runs per message, so it matters.
+    limit = get_privacy_limit(platform, bridge)
+    if limit <= 0:
+        return 0
+
+    platform = platform.lower()
+    user_str = str(user_id)
+    chan_str = str(channel_id) if channel_id is not None else None
+
+    chan_lvl = None
+    all_lvl = None
+    for line in _read_line_file(PRIVACY_FILE):
+        parts = line.split(':')
+        if len(parts) != 4:
+            continue
+        p, u, c, lvl = parts
+        if p != platform or u != user_str:
+            continue
+        try:
+            lvl_int = int(lvl)
+        except ValueError:
+            continue
+        if lvl_int not in (0, 1, 2):
+            continue
+        if c == 'all':
+            all_lvl = lvl_int
+        elif chan_str is not None and c == chan_str:
+            chan_lvl = lvl_int
+
+    if chan_lvl is not None:
+        raw = chan_lvl
+    elif all_lvl is not None:
+        raw = all_lvl
+    else:
+        raw = 0
+
+    # Runtime cap only - txt is not rewritten. If admin lowers the cap later
+    # (e.g. 2 -> 1), users with stored level 2 are simply treated as 1; raising
+    # the cap back to 2 restores their original level transparently.
+    if raw < 0:
+        return 0
+    return min(raw, limit)
+
+
+def set_privacy_level(platform: str, user_id, scope, level: int) -> None:
+    platform = platform.lower()
+    user_str = str(user_id)
+    scope_str = str(scope)
+    if level not in (0, 1, 2):
+        raise ValueError("level must be 0, 1, or 2")
+
+    _ensure_file(PRIVACY_FILE)
+    target_prefix = f"{platform}:{user_str}:{scope_str}:"
+    keep = []
+    try:
+        with open(PRIVACY_FILE, 'r', encoding='utf-8') as f:
+            for line in f:
+                stripped = line.rstrip('\n')
+                if not stripped.strip():
+                    continue
+                if stripped.startswith(target_prefix):
+                    continue
+                keep.append(stripped)
+    except FileNotFoundError:
+        pass
+
+    with open(PRIVACY_FILE, 'w', encoding='utf-8') as f:
+        for line in keep:
+            f.write(line + '\n')
+        if level != 0:
+            f.write(f"{platform}:{user_str}:{scope_str}:{level}\n")
+
+
+def list_privacy_settings(platform: str, user_id) -> List[Tuple[str, int]]:
+    platform = platform.lower()
+    user_str = str(user_id)
+    out = []
+    for line in _read_line_file(PRIVACY_FILE):
+        parts = line.split(':')
+        if len(parts) != 4:
+            continue
+        p, u, c, lvl = parts
+        if p != platform or u != user_str:
+            continue
+        try:
+            lvl_int = int(lvl)
+        except ValueError:
+            continue
+        if lvl_int not in (0, 1, 2):
+            continue
+        out.append((c, lvl_int))
+    return out
+
+
+def compute_incognito_name(channel_id, user_id) -> str:
+    """Deterministic 'Incognito #NNNN' name. Same channel + same user = same number;
+    different channel (or different platform) = different number."""
+    h = hashlib.sha256(f"{channel_id}:{user_id}".encode('utf-8')).hexdigest()
+    return f"Incognito #{int(h[:8], 16) % 10000}"
+
+
+def compute_incognito_id(channel_id, user_id) -> str:
+    """Stable synthetic user_id for the avatar cache, so the generated identicon
+    is reused across all of one user's incognito messages in a channel."""
+    h = hashlib.sha256(f"{channel_id}:{user_id}".encode('utf-8')).hexdigest()
+    return f"incognito_{h[:16]}"
+
+
+def _parse_avatar_bg(bg_color):
+    """Resolve the user-configured background to an RGBA tuple.
+    'transparent' (default) -> (0,0,0,0). Hex -> RGB+255. Bad input -> #323339 fallback."""
+    if bg_color is None:
+        return (0, 0, 0, 0)
+    s = str(bg_color).strip().lower()
+    if s in ('', 'transparent', 'none', 'alpha'):
+        return (0, 0, 0, 0)
+    s = s.lstrip('#')
+    try:
+        if len(s) == 6:
+            return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16), 255)
+        if len(s) == 3:
+            return (int(s[0]*2, 16), int(s[1]*2, 16), int(s[2]*2, 16), 255)
+    except Exception:
+        pass
+    return (50, 51, 57, 255)  # #323339 fallback
+
+
+def ensure_incognito_avatar(avatar_db, platform: str, channel_id, user_id,
+                            bg_color: str = 'transparent') -> Optional[str]:
+    """Make sure the avatar cache has an identicon for this incognito user.
+    Returns the synthetic user_id to use as `author_id` on the BridgeMessage,
+    or None if the avatar cache or Pillow is unavailable.
+    Idempotent: only generates+stores if the cache has no entry yet.
+    """
+    if avatar_db is None:
+        return None
+    cache_key = compute_incognito_id(channel_id, user_id)
+    try:
+        existing = get_cached_avatar(avatar_db, cache_key)
+    except Exception:
+        existing = None
+    if existing and existing.get('avatar_bytes'):
+        return cache_key
+    avatar_bytes = compute_incognito_avatar_bytes(channel_id, user_id, bg_color)
+    if not avatar_bytes:
+        # Pillow missing - return the cache_key anyway so the synthetic ID
+        # remains stable; pilgrims will simply send no avatar.
+        return cache_key
+    try:
+        store_avatar_cache(
+            avatar_db, cache_key, platform,
+            avatar_hash=compute_avatar_hash(avatar_bytes),
+            avatar_bytes=avatar_bytes,
+        )
+    except Exception as e:
+        log_warn(f"Failed to store incognito avatar for {cache_key}: {e}")
+    return cache_key
+
+
+_INCOGNITO_GRID = 16   # cells per side (mirrored on Y axis -> needs GRID/2 bits per row)
+_INCOGNITO_CELL = 32   # px per cell -> 16 * 32 = 512px image
+
+
+def compute_incognito_avatar_bytes(channel_id, user_id, bg_color='transparent') -> Optional[bytes]:
+    """Generate a deterministic GitHub-style identicon PNG for an Incognito user.
+    16x16 grid mirrored on the Y axis, color derived from sha256(channel:user).
+
+    bg_color: 'transparent' (default), or a hex string like '#323339'.
+    Returns PNG bytes, or None if Pillow is not installed.
+    Same (channel_id, user_id) always returns the same image.
+    """
+    try:
+        from PIL import Image, ImageDraw
+        import colorsys
+    except ImportError:
+        return None
+
+    # Use a deeper hash so the 128 bits we need (16x8) come from a single source.
+    h = hashlib.sha512(f"{channel_id}:{user_id}".encode('utf-8')).digest()
+
+    # Foreground color: vivid HSV from first 3 bytes (saturated, mid-bright).
+    hue = h[0] / 255.0
+    sat = 0.55 + (h[1] / 255.0) * 0.25  # 0.55 - 0.80
+    val = 0.70 + (h[2] / 255.0) * 0.20  # 0.70 - 0.90
+    r, g, b = [int(c * 255) for c in colorsys.hsv_to_rgb(hue, sat, val)]
+    fg = (r, g, b, 255)
+
+    bg = _parse_avatar_bg(bg_color)
+
+    # GRIDxGRID grid mirrored on Y axis. 16x16 -> 8 left cols x 16 rows = 128 bits.
+    grid_n = _INCOGNITO_GRID
+    half = grid_n // 2
+    grid = [[False] * grid_n for _ in range(grid_n)]
+    bit_idx = 0
+    src = h[3:]  # 61 bytes left from sha512 - more than enough for 128 bits
+    for y in range(grid_n):
+        for x in range(half):
+            on = bool((src[bit_idx // 8] >> (bit_idx % 8)) & 1)
+            grid[y][x] = on
+            grid[y][grid_n - 1 - x] = on  # mirror
+            bit_idx += 1
+
+    cell = _INCOGNITO_CELL
+    size = cell * grid_n  # 512px (no outer padding - the grid IS the avatar)
+    img = Image.new('RGBA', (size, size), bg)
+    draw = ImageDraw.Draw(img)
+    for y in range(grid_n):
+        for x in range(grid_n):
+            if grid[y][x]:
+                x0 = x * cell
+                y0 = y * cell
+                # No -1 on the right/bottom: cells abut cleanly at this resolution.
+                draw.rectangle((x0, y0, x0 + cell, y0 + cell), fill=fg)
+
+    import io as _io
+    buf = _io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue()
+
+
+# ── link replacements ─────────────────────────────────
+# link_replacements.txt format:  source_domain:replacement_domain
+# Matches the URL host (also www.<source> and *.source) and rewrites it.
+
+def get_link_replacements() -> List[Tuple[str, str]]:
+    rules = []
+    for line in _read_line_file(LINK_REPLACEMENTS_FILE):
+        if ':' not in line or line.lstrip().startswith('#'):
+            continue
+        src, dst = line.split(':', 1)
+        src = src.strip().lower()
+        dst = dst.strip()
+        if src and dst:
+            rules.append((src, dst))
+    return rules
+
+
+def apply_link_replacements(text: Optional[str]) -> Optional[str]:
+    if not text:
+        return text
+    rules = get_link_replacements()
+    if not rules:
+        return text
+
+    def _swap(match):
+        url = match.group(0)
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or '').lower()
+            for src, dst in rules:
+                if host == src or host == 'www.' + src or host.endswith('.' + src):
+                    return url.replace(parsed.netloc, dst, 1)
+        except Exception:
+            pass
+        return url
+
+    return re.sub(r'https?://[^\s<>"\)\]]+', _swap, text)
 
 
 def _read_domain_file(path: str) -> List[str]:

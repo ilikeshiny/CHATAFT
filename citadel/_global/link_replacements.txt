@@ -1,0 +1,13 @@
+# Link replacement rules
+# Format: source_domain:replacement_domain
+# Matches the URL host (also www.<source> and any subdomain.source).
+# Lines starting with # are comments.
+#
+# Examples (uncomment to enable):
+x.com:i.fixupx.com
+fixupx.com:i.fixupx.com
+fixvx.com:i.fixupx.com
+twitter.com:i.fxtwitter.com
+fxtwitter.com:i.fxtwitter.com
+instagram.com:kkinstagram.com
+tiktok.com:tnktok.com

@@ -129,7 +129,7 @@ class Arbiter:
             'discord':   'DISCORD_TOKEN',
             'telegram':  'TELEGRAM_BOT_TOKEN',
             'stoatchat': 'STOATCHAT_TOKEN',
-            'matrix':    ['MATRIX_BOT_TOKEN', 'MATRIX_AS_TOKEN'],  # needs at least one
+            'matrix':    ['MATRIX_BOT_TOKEN', 'MATRIX_AS_TOKEN', 'MATRIX_BOT_PASSWORD'],  # needs at least one
         }
 
         self._platforms = list(self.available_components.keys())
@@ -186,6 +186,12 @@ class Arbiter:
             'min_height': None,
             'auto_dashboard_pin': True,
             'headless': False,
+            # auto-restart: bounce all components every N hours during a
+            # quiet window to flush stale per-process caches. 0/blank in
+            # `auto_restart_timer` disables the feature entirely.
+            'auto_restart_timer': 0,        # hours; 0 = disabled
+            'auto_restart_clear_msg': 15,   # minutes of idle required
+            'auto_restart_max_wait': 12,    # hours; force-restart if no quiet window
         }
         try:
             if not os.path.isfile(CONFIG_FILE):
@@ -218,6 +224,20 @@ class Arbiter:
             raw_hl = parser.get('Arbiter', 'arbiter_headless', fallback='').strip().lower()
             if raw_hl in ('true', 'yes', 'on', '1'):
                 defaults['headless'] = True
+
+            # Auto-restart settings. Blank/missing keeps the default above;
+            # invalid integers are ignored silently to avoid breaking startup.
+            for key, fallback_val in (
+                ('auto_restart_timer', defaults['auto_restart_timer']),
+                ('auto_restart_clear_msg', defaults['auto_restart_clear_msg']),
+                ('auto_restart_max_wait', defaults['auto_restart_max_wait']),
+            ):
+                raw = parser.get('Arbiter', key, fallback='').strip().lower()
+                if raw and raw not in ('false', 'no', 'off', ''):
+                    try:
+                        defaults[key] = max(0, int(raw))
+                    except ValueError:
+                        pass
 
             return defaults
         except Exception:
@@ -290,12 +310,17 @@ class Arbiter:
         return 0
 
     def _get_usable_height(self) -> int:
-        """Terminal height minus chrome offset. Always at least 20."""
+        """Terminal height minus chrome offset. Always at least 20.
+
+        No extra safety margin: in pinned mode the cursor is hidden so we
+        can claim every visible row. The chrome_offset itself accounts for
+        terminal-emulator chrome (tabs/status bars) on known terminals.
+        """
         try:
             raw = os.get_terminal_size().lines
         except (OSError, ValueError):
             raw = 40
-        return max(20, raw - self._chrome_offset - 1)
+        return max(20, raw - self._chrome_offset)
 
     def _ensure_console_size(self):
         if sys.platform != 'win32':
@@ -360,9 +385,13 @@ class Arbiter:
 
     def _write_frame(self, frame: str):
         if self._terminal_type == 'modern':
+            # Keep the cursor hidden across redraws. Toggling visibility on each
+            # frame (which used to happen here) caused a visible flicker in the
+            # bottom-right where the cursor lands after a paint. The cursor is
+            # restored once when pin mode exits.
             sys.stdout.write('\033[?25l\033[H')
             sys.stdout.write(frame)
-            sys.stdout.write('\033[J\033[?25h')
+            sys.stdout.write('\033[J')
             sys.stdout.flush()
         else:
             os.system('cls' if sys.platform == 'win32' else 'clear')
@@ -692,15 +721,20 @@ class Arbiter:
                         log_success(f"{status.component} is ready")
 
             elif status.status == 'stopped':
-                if status.component in self.active_components:
-                    self.active_components.discard(status.component)
-                    with self.output_lock:
-                        log_warn(f"{status.component} has stopped")
+                self.active_components.discard(status.component)
 
             elif status.status == 'error':
                 with self.output_lock:
                     log_error(f"{status.component} error: {status.message}")
                 self._record_error(status.component, status.message or 'unknown error')
+
+            else:
+                # Any other non-terminal status (e.g. 'starting') still proves the
+                # component is alive and reachable. Make sure it's listed - the
+                # initial 'ready' message can race with the consumer attachment
+                # or get coalesced by the broker, leaving us stuck on 'starting'.
+                if status.component not in self.active_components:
+                    self.active_components.add(status.component)
 
             ch.basic_ack(delivery_tag=method.delivery_tag)
         except Exception as e:
@@ -908,6 +942,113 @@ class Arbiter:
             log_success(f"Auto-started: {', '.join(started)}")
 
     # ----------------------------------------------------------------
+    #  Auto-restart (periodic component bounce during idle window)
+    # ----------------------------------------------------------------
+
+    def _auto_restart_loop(self):
+        """Background thread that bounces all components every N hours.
+
+        - Sleeps for `auto_restart_timer` hours after startup (and after
+          each restart).
+        - Then polls every 30s waiting for a quiet window: no routed
+          message for `auto_restart_clear_msg` minutes.
+        - If `auto_restart_max_wait` hours pass without a quiet window
+          appearing, force-restarts anyway so busy bridges still get
+          their periodic cache flush.
+        - Honors `self.running` so it exits cleanly on shutdown.
+        """
+        timer_hours = self._arbiter_config.get('auto_restart_timer', 0)
+        if not timer_hours or timer_hours <= 0:
+            return  # feature disabled
+
+        quiet_minutes = self._arbiter_config.get('auto_restart_clear_msg', 15)
+        max_wait_hours = self._arbiter_config.get('auto_restart_max_wait', 12)
+        timer_seconds = timer_hours * 3600
+        quiet_seconds = quiet_minutes * 60
+        max_wait_seconds = max_wait_hours * 3600
+
+        log_info(
+            f"Auto-restart armed: cycle every {timer_hours}h, "
+            f"requires {quiet_minutes}m idle (max wait {max_wait_hours}h)."
+        )
+
+        while self.running:
+            # Phase 1: wait the full timer window. Sleep in short chunks so
+            # shutdown is responsive.
+            cycle_start = time.monotonic()
+            while self.running and (time.monotonic() - cycle_start) < timer_seconds:
+                time.sleep(30)
+            if not self.running:
+                return
+
+            # Phase 2: wait for a quiet window, up to max_wait_seconds.
+            log_info(
+                f"Auto-restart cycle elapsed ({timer_hours}h); waiting for "
+                f"{quiet_minutes}m of idle traffic before bouncing components."
+            )
+            wait_start = time.monotonic()
+            forced = False
+            while self.running:
+                idle_for = self._idle_seconds()
+                if idle_for >= quiet_seconds:
+                    break
+                if (time.monotonic() - wait_start) >= max_wait_seconds:
+                    forced = True
+                    log_warn(
+                        f"Auto-restart: no quiet window in {max_wait_hours}h, "
+                        f"forcing restart with traffic still flowing."
+                    )
+                    break
+                time.sleep(30)
+            if not self.running:
+                return
+
+            # Phase 3: perform the restart. Catches its own errors so a
+            # failed cycle doesn't kill the timer thread.
+            try:
+                self._perform_auto_restart(forced=forced)
+            except Exception as exc:
+                log_error(f"Auto-restart failed: {exc}")
+
+    def _idle_seconds(self) -> float:
+        """Seconds since the most recent routed message.
+
+        Returns a large number when nothing has ever routed, so a fresh
+        instance qualifies as 'idle' immediately after its timer expires.
+        """
+        last = self._last_route_time
+        if last is None:
+            return float('inf')
+        return (datetime.now() - last).total_seconds()
+
+    def _perform_auto_restart(self, forced: bool = False):
+        """Stop all components, clear stale in-memory state, restart."""
+        tag = "forced" if forced else "scheduled"
+        with self.output_lock:
+            log_info(f"Auto-restart ({tag}): stopping components for cache flush.")
+
+        self.stop_all_components()
+
+        # Clear arbiter's own in-memory caches so the dashboard starts
+        # fresh too. We deliberately keep _routed_count cumulative since
+        # uptime stats are more useful when continuous.
+        self._route_log.clear()
+        self._error_log.clear()
+        self._warn_log.clear()
+        self._error_counts = {p: 0 for p in self._platforms}
+        self._warn_counts = {p: 0 for p in self._platforms}
+        self._pending_counts.clear()
+        self._last_route_time = None
+
+        # Brief pause so subprocess exit / port release settles before
+        # we spawn fresh processes that may try to grab the same handles.
+        time.sleep(2)
+
+        self.auto_start_components()
+        with self.output_lock:
+            log_success(f"Auto-restart ({tag}): components back up, caches cleared.")
+
+    # ----------------------------------------------------------------
     #  Rich dashboard
     # ----------------------------------------------------------------
 
@@ -1089,7 +1230,14 @@ class Arbiter:
 
         narrow = term_width < 100
 
-        outer_chrome = 4
+        # outer_chrome = 2 accounts for the dashboard Panel's actual top
+        # and bottom border rows (box.DOUBLE). Anything larger leaks out
+        # as visible empty rows below the dashboard and also pushes the
+        # bottom border off the visible area in pinned mode. With this
+        # set to 2, dashboard_rows + hint exactly equals term_height,
+        # so Mode sits flush against the bottom and both DOUBLE borders
+        # are visible at the terminal edges.
+        outer_chrome = 2
         hint_line = 1
         fixed_rows = 3 + 3 + 3
         available = term_height - outer_chrome - hint_line - fixed_rows
@@ -1099,32 +1247,70 @@ class Arbiter:
         num_comps = max(len(self.active_components), len(self.component_processes), len(startable))
         num_bridges = max(len(self._routing_table), 1)
 
+        # Per-panel chrome: 2 panel borders + 2 table chrome (header + separator)
+        # + 1 slack row that Rich consumes for SIMPLE_HEAVY/ROUNDED. Total 5.
+        per_table_chrome = 5
+        comp_ideal = num_comps + per_table_chrome
+        bridge_ideal = num_bridges + per_table_chrome
+
+        # Priority allocation: components > bridges > activity. Activity has
+        # NO floor - if components and bridges claim all the room, activity
+        # disappears entirely. When room is plentiful, it takes the rest.
         if narrow:
-            ideal_tables = (num_comps + 4) + (num_bridges + 4)
+            comp_h = min(comp_ideal, available)
+            bridge_h = min(bridge_ideal, max(0, available - comp_h))
+            tables_height = comp_h + bridge_h
+            activity_space = max(0, available - tables_height)
         else:
-            ideal_tables = max(num_comps, num_bridges) + 4
+            # Side-by-side: both tables share one row height.
+            tables_height = min(max(comp_ideal, bridge_ideal), available)
+            tables_height = max(2, tables_height)
+            activity_space = max(0, available - tables_height)
 
-        # Minimum tables height must fit ALL running components + bridges (never truncate)
-        running_rows = num_comps + num_bridges
-        # +4 for headers/borders of both tables in wide mode, +8 in narrow (stacked)
-        min_tables = running_rows + (8 if narrow else 4)
+        # Activity sizing strategy:
+        #  - Tables (Components/Bridges) are sized to their ideal height and
+        #    never shrink for activity's sake.
+        #  - Activity claims ALL leftover space between tables and Mode in
+        #    one Panel. It does NOT grow with content - it always fills the
+        #    empty room and just shows blank interior rows when entries are
+        #    sparse.
+        #  - Under severe cramping (< 3 rows leftover) activity disappears
+        #    entirely and the orphan rows go back to tables, keeping the
+        #    dashboard flush to the terminal bottom.
+        if self._error_view_active and activity_space < 3:
+            activity_space = 3
+            show_activity = True
+        elif activity_space < 3:
+            # Donate orphan rows to tables so layout sum still equals
+            # `available` and the dashboard fills the terminal.
+            tables_height += activity_space
+            activity_space = 0
+            show_activity = False
+        else:
+            show_activity = True
 
-        # Tables always get enough space for all running platforms; activity fills the rest
-        tables_height = min(ideal_tables, max(min_tables, available // 3))
-        activity_space = max(2, available - tables_height)
-
-        # Trim activity lines to fit
-        if not self._error_view_active:
-            activity_lines = activity_lines[-(activity_space - 4):]
+        # Fit the line buffer to the visible interior. Rich's box.ROUNDED
+        # Panel uses 2 chrome rows (top border with embedded title, bottom
+        # border). Pad with blanks if we have too few lines so the Panel
+        # reaches the full slot height - otherwise the unused rows of the
+        # Layout slot appear as a visible gap ABOVE Mode.
+        if show_activity and not self._error_view_active:
+            visible = max(0, activity_space - 2)
+            if len(activity_lines) > visible:
+                activity_lines = activity_lines[-visible:]
+            while len(activity_lines) < visible:
+                activity_lines.append('')
 
         layout = Layout()
-        layout.split_column(
+        sections = [
             Layout(name="stats", size=3),
             Layout(name="tables", size=tables_height),
             Layout(name="pending", size=3),
-            Layout(name="activity"),
-            Layout(name="mode", size=3),
-        )
+        ]
+        if show_activity:
+            sections.append(Layout(name="activity", size=activity_space))
+        sections.append(Layout(name="mode", size=3))
+        layout.split_column(*sections)
 
         layout["stats"].update(Panel(stats_text, box=box.SIMPLE, style=""))
         layout["pending"].update(Panel(pending_rich, box=box.SIMPLE, style=""))
@@ -1141,10 +1327,16 @@ class Arbiter:
 
         tables_layout = Layout()
         if narrow:
-            tables_layout.split_column(
-                Layout(comp_panel),
-                Layout(bridge_panel),
-            )
+            # Sized split: components gets its allocated height, bridges
+            # takes the remainder. When bridges was squeezed to zero, drop
+            # it entirely so components claims the whole row.
+            if bridge_h > 0:
+                tables_layout.split_column(
+                    Layout(comp_panel, size=comp_h),
+                    Layout(bridge_panel),
+                )
+            else:
+                tables_layout.update(comp_panel)
         else:
             tables_layout.split_row(
                 Layout(comp_panel),
@@ -1152,15 +1344,22 @@ class Arbiter:
             )
         layout["tables"].update(tables_layout)
 
-        activity_border = "red" if self._error_view_active else "cyan"
-        activity_str = '\n'.join(activity_lines)
-        layout["activity"].update(
-            Panel(
-                activity_str, title=activity_title,
-                border_style=activity_border, box=box.ROUNDED,
+        if show_activity:
+            activity_border = "red" if self._error_view_active else "cyan"
+            activity_str = '\n'.join(activity_lines)
+            layout["activity"].update(
+                Panel(
+                    activity_str, title=activity_title,
+                    border_style=activity_border, box=box.ROUNDED,
+                )
             )
-        )
 
+        # Explicit height forces Rich to render the Panel at exactly this
+        # many rows regardless of what the inner Layout decides to do.
+        # dashboard_height + hint(1) = term_height, so the bottom DOUBLE
+        # border lands one row above the terminal edge with the hint on the
+        # final visible row.
+        dashboard_height = term_height - 1
         dashboard = Panel(
             layout,
             title="[bold white] ARBITER DASHBOARD [/]",
@@ -1168,6 +1367,7 @@ class Arbiter:
             border_style="cyan",
             box=box.DOUBLE,
             padding=(0, 1),
+            height=dashboard_height,
         )
         return dashboard
 
@@ -1242,12 +1442,17 @@ class Arbiter:
             # Flash mode: show temporary result message
             if self._cmd_flash and time.monotonic() < self._cmd_flash_until:
                 return f"  [bold yellow]{self._cmd_flash}[/]"
-            # Normal mode: show key hints
+            # Normal mode: show key hints. [E] and [C] are always present
+            # so the affordance is discoverable even when the error log is
+            # empty; the error count is appended when nonzero so the user
+            # can see at a glance whether anything is wrong.
             self._cmd_flash = ''
             hints = [r"\[/] cmd", "[Q] exit"]
             total_err = sum(self._error_counts.values())
             if total_err > 0:
                 hints.append(f"[E] errors ({total_err})")
+            else:
+                hints.append("[E] errors")
             hints.append("[C] clear")
             return f"  [dim]{'  '.join(hints)}[/]"
 
@@ -1408,10 +1613,10 @@ class Arbiter:
                             break
 
                         elif key in (b'e', b'E'):
-                            total_err = sum(self._error_counts.values())
-                            if total_err == 0:
-                                break
-
+                            # Always show the platform-selection prompt, even
+                            # when the error log is empty - mirrors [C] clear's
+                            # behavior. The error overlay itself handles the
+                            # "no errors recorded" case with a friendly message.
                             flash_frame = _render_flash()
                             self._write_frame(flash_frame)
                             time.sleep(0.2)
@@ -1509,7 +1714,7 @@ class Arbiter:
                 for name, process in list(self.component_processes.items()):
                     if process.poll() is not None:
                         rc = process.poll()
-                        log_warn(f"{name} stopped unexpectedly (exit code {rc}), auto-restarting in 5s...")
+                        log_warn(f"{name} exited (rc={rc}), auto-restart in 5s")
                         del self.component_processes[name]
                         self.active_components.discard(name)
                         self.component_status.pop(name, None)
@@ -1546,8 +1751,26 @@ class Arbiter:
                             self.start_routing_consumers()
                             _last_successful_event = time.time()
 
-                    # Check for silent components (process alive but no status updates)
+                    # Reconcile active_components against recent status traffic.
+                    # If the subprocess is alive and we've heard *anything* from
+                    # it in the last 180s, treat it as active. Covers the case
+                    # where the initial 'ready' raced with consumer attach and
+                    # only later heartbeats made it through.
                     now = time.time()
+                    for name, process in list(self.component_processes.items()):
+                        if process.poll() is not None:
+                            continue
+                        if name in self.active_components:
+                            continue
+                        last_heard = self._last_status_heard.get(name)
+                        if last_heard and (now - last_heard) < 180:
+                            self.active_components.add(name)
+                            if self.component_status.get(name) not in ('ready', 'error'):
+                                self.component_status[name] = 'ready'
+                            with self.output_lock:
+                                log_info(f"Reconciled {name} as active (recent status traffic)")
+
+                    # Check for silent components (process alive but no status updates)
                     for name, process in list(self.component_processes.items()):
                         if process.poll() is not None:
                             continue  # Already dead, handled by auto-restart above
@@ -2019,9 +2242,20 @@ class Arbiter:
 
     def signal_handler(self, signum, frame):
         print()
+        # Second Ctrl+C while already shutting down -> hard exit. Some teardown
+        # paths (pika BlockingConnection.close on a half-dead socket, child
+        # processes ignoring SIGTERM) can take a long time, and the user
+        # should always be able to bail out.
+        if not self.running:
+            log_warn("Second interrupt received, exiting hard.")
+            os._exit(130)
         log_info("Received interrupt signal, shutting down...")
         self.running = False
         self._pin_active = False
+        # Raise so the blocking input() in handle_commands unwinds immediately
+        # (PEP 475 restarts the syscall otherwise, leaving the arbiter wedged
+        # until the user hits Enter).
+        raise KeyboardInterrupt()
 
     def _wait_for_components(self, timeout: float = 30.0):
         started = set(self.component_processes.keys())
@@ -2082,6 +2316,11 @@ class Arbiter:
 
         monitor = threading.Thread(target=self.monitor_loop, daemon=True)
         monitor.start()
+
+        # Periodic component bounce. Daemon so it dies with the arbiter.
+        # Internally no-ops when auto_restart_timer is 0/blank.
+        auto_restart = threading.Thread(target=self._auto_restart_loop, daemon=True)
+        auto_restart.start()
 
         self.auto_start_components()
 

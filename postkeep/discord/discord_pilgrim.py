@@ -1,5 +1,3 @@
-import discord
-from discord import Webhook
 import asyncio
 import pika
 import json
@@ -26,6 +24,7 @@ class DiscordPilgrim:
     def __init__(self, core):
         self.core = core
         self.bot = core.bot
+        self._dlib = core.discord_lib
         self.component_name = 'discord_pilgrim'
         self._loop = None
 
@@ -109,7 +108,7 @@ class DiscordPilgrim:
                     return None
 
             import io
-            file = discord.File(io.BytesIO(avatar_bytes), filename=f"avatar_{entity_id}.png")
+            file = self._dlib.File(io.BytesIO(avatar_bytes), filename=f"avatar_{entity_id}.png")
             message = await channel.send(f"Avatar for {entity_id}", file=file)
 
             if message.attachments:
@@ -563,7 +562,7 @@ class DiscordPilgrim:
                 return
 
             async with aiohttp.ClientSession() as session:
-                webhook = Webhook.from_url(ds.webhook_url, session=session)
+                webhook = self._dlib.Webhook.from_url(ds.webhook_url, session=session)
                 safe_avatar = avatar_url if avatar_url and not avatar_url.startswith('file://') else None
                 if files:
                     chunks = [files[i:i + self.MAX_ATTACHMENTS]
@@ -658,7 +657,7 @@ class DiscordPilgrim:
                     except Exception:
                         pass
                     try:
-                        files.append(discord.File(p, filename=fn, spoiler=att.get('spoiler', False)))
+                        files.append(self._dlib.File(p, filename=fn, spoiler=att.get('spoiler', False)))
                     except Exception as e:
                         log_warn(f"Failed to prepare file for send: {p} ({e})", self.component_name)
             return files
@@ -763,10 +762,10 @@ class DiscordPilgrim:
                 return
 
             try:
-                is_thread = isinstance(channel, discord.Thread)
+                is_thread = isinstance(channel, self._dlib.Thread)
                 if getattr(msg, 'webhook_id', None) and ds.webhook_url:
                     async with aiohttp.ClientSession() as session:
-                        webhook = Webhook.from_url(ds.webhook_url, session=session)
+                        webhook = self._dlib.Webhook.from_url(ds.webhook_url, session=session)
                         if is_thread:
                             await webhook.edit_message(message_id=discord_message_id, content=new_text_raw, thread=channel)
                         else:
@@ -793,21 +792,11 @@ class DiscordPilgrim:
     async def handle_delete(self, data):
         try:
             bridge_name = data.get('bridge_name')
+            # Only act when the payload is explicitly addressed to us. The
+            # source scribe publishes one message per target platform with
+            # that target's message_id - looking up via a sibling platform's
+            # ID here causes us to fire once per sibling target.
             raw_id = data.get('discord_message_id')
-            if not raw_id:
-                # Try to look up from source mapping
-                source = data.get('source', '')
-                src_id = None
-                for key in data:
-                    if key.endswith('_message_id') and key != 'discord_message_id':
-                        src_id = data[key]
-                        if not source:
-                            source = key.replace('_message_id', '')
-                        break
-                if source and src_id:
-                    db = self.core.bridge_dbs.get(bridge_name)
-                    if db:
-                        raw_id = db.get_mapped_id(source, str(src_id), 'discord')
             if not raw_id:
                 return
             discord_message_id = int(raw_id)
@@ -827,13 +816,13 @@ class DiscordPilgrim:
                 pass
 
             channel = self.bot.get_channel(ds.channel_id_int) or await self.bot.fetch_channel(ds.channel_id_int)
-            is_thread = isinstance(channel, discord.Thread)
+            is_thread = isinstance(channel, self._dlib.Thread)
 
             try:
                 msg = await channel.fetch_message(discord_message_id)
                 if getattr(msg, 'webhook_id', None) and ds.webhook_url:
                     async with aiohttp.ClientSession() as session:
-                        webhook = Webhook.from_url(ds.webhook_url, session=session)
+                        webhook = self._dlib.Webhook.from_url(ds.webhook_url, session=session)
                         if is_thread:
                             await webhook.delete_message(discord_message_id, thread=channel)
                         else:

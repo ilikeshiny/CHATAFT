@@ -18,15 +18,33 @@ from postkeep.papyrus import (
     BridgeMessage, ensure_cache_dir,
     get_cached_avatar, store_avatar_cache, compute_avatar_hash,
     is_user_ignored,
+    normalize_mime_type,
 )
 
 
 class MatrixScribe:
+    # Events older than (session_start - SLACK) are treated as catch-up replay
+    # from the initial /sync and ignored. Prevents historical redactions / edits
+    # from re-firing across the bridge on every restart.
+    STALE_EVENT_SLACK_SEC = 5
+
     def __init__(self, core):
         self.core = core
         self._rabbitmq_conn = None
         self._rabbitmq_channel = None
         self._recently_seen_events = deque(maxlen=500)
+        self._session_start_ts = time.time()
+
+    def _is_stale_event(self, event) -> bool:
+        """True if the event predates this scribe session (i.e. it arrived via
+        initial sync catch-up). We deliberately drop offline-window deletes and
+        edits because replaying them on restart causes spurious 'message not
+        found' errors on target platforms."""
+        ts_ms = getattr(event, 'timestamp', None)
+        if not ts_ms:
+            return False
+        event_ts = ts_ms / 1000.0
+        return event_ts < (self._session_start_ts - self.STALE_EVENT_SLACK_SEC)
 
     # ========== Bot Mode Handler Registration ==========
 
@@ -288,6 +306,11 @@ class MatrixScribe:
     # ========== Edit Handler ==========
 
     async def _handle_edit(self, event, bridge):
+        # Drop historical edits replayed by initial sync (same reasoning as
+        # _handle_redaction - re-firing edits hits 'message can't be edited').
+        if self._is_stale_event(event):
+            return
+
         # Check echo prevention for edits
         local_edits = getattr(self.core, '_local_matrix_edits', None)
         original_event_id_attr = getattr(event.content.relates_to, 'event_id', None)
@@ -320,28 +343,34 @@ class MatrixScribe:
         sender = str(event.sender)
         author_name = await self._get_display_name(sender) or sender
 
-        for platform, platform_id in all_mappings.items():
-            if platform == 'matrix':
-                continue
+        # Single body with all target IDs - arbiter routes once per
+        # target queue, each pilgrim picks its own *_message_id. The
+        # matrix_message_id is the source ID (informational - matrix
+        # pilgrim is excluded by arbiter as the source).
+        targets = {p: pid for p, pid in all_mappings.items() if p != 'matrix'}
+        if targets:
             control_msg = {
                 'type': 'edit',
                 'source': 'matrix',
                 'bridge_name': bridge.name,
-                f'{platform}_message_id': platform_id,
                 'matrix_message_id': original_event_id,
                 'new_text': new_text,
                 'author_name': author_name,
             }
+            for platform, platform_id in targets.items():
+                control_msg[f'{platform}_message_id'] = platform_id
             self._publish_raw(json.dumps(control_msg))
-            log_debug(f"[matrix-scribe] Published edit for {original_event_id} -> {platform}")
+            log_debug(f"[matrix-scribe] Published edit for {original_event_id} -> {','.join(targets.keys())}")
 
     # ========== Redaction (Delete) Handler ==========
 
     async def _handle_redaction(self, event):
+        # Drop historical redactions replayed by initial sync. Otherwise every
+        # restart re-fires the most recent delete and target platforms 404.
+        if self._is_stale_event(event):
+            return
+
         redacted_event_id = str(event.redacts) if hasattr(event, 'redacts') and event.redacts else None
-        if not redacted_event_id:
-            # Try content-based redacts
-            redacted_event_id = str(getattr(event, 'redacts', None) or '')
         if not redacted_event_id:
             return
 
@@ -361,19 +390,25 @@ class MatrixScribe:
         if not db:
             return
 
+        # The redaction event's sender is the user doing the delete (not the
+        # original author - Matrix doesn't carry that back through redactions).
+        redactor_name = await self._get_display_name(str(event.sender)) or str(event.sender)
+
         all_mappings = db.get_all_mappings('matrix', redacted_event_id)
-        for platform, platform_id in all_mappings.items():
-            if platform == 'matrix':
-                continue
+        targets = {p: pid for p, pid in all_mappings.items() if p != 'matrix'}
+        if targets:
+            # Single body with all target IDs (see edit handler for why).
             control_msg = {
                 'type': 'delete',
                 'source': 'matrix',
                 'bridge_name': bridge_name,
-                f'{platform}_message_id': platform_id,
+                'author_name': redactor_name,
                 'matrix_message_id': redacted_event_id,
             }
+            for platform, platform_id in targets.items():
+                control_msg[f'{platform}_message_id'] = platform_id
             self._publish_raw(json.dumps(control_msg))
-            log_debug(f"[matrix-scribe] Published delete for {redacted_event_id} -> {platform}")
+            log_debug(f"[matrix-scribe] Published delete for {redacted_event_id} -> {','.join(targets.keys())}")
 
     # ========== Member Events ==========
 
@@ -544,8 +579,18 @@ class MatrixScribe:
         return f"{homeserver}/_matrix/client/v1/media/download/{parts}"
 
     def _get_auth_headers(self) -> dict:
-        """Return Authorization header for authenticated media requests."""
-        token = self.core.settings.get('MATRIX_BOT_TOKEN', '')
+        """Return Authorization header for authenticated media requests.
+
+        Reads the live access token from the active mautrix client (which the
+        background refresher mutates in place when MAS rotates tokens). Falls
+        back to the bootstrap MATRIX_BOT_TOKEN only if the client isn't up yet.
+        """
+        token = ''
+        client = getattr(self.core, 'client', None)
+        if client is not None and getattr(client, 'api', None) is not None:
+            token = getattr(client.api, 'token', '') or ''
+        if not token:
+            token = self.core.settings.get('MATRIX_BOT_TOKEN', '') or ''
         return {'Authorization': f'Bearer {token}'} if token else {}
 
     # ========== Media Download ==========
@@ -563,7 +608,8 @@ class MatrixScribe:
 
         filename = event.content.body or 'file'
         info = getattr(event.content, 'info', None)
-        mimetype = info.mimetype if info and hasattr(info, 'mimetype') and info.mimetype else 'application/octet-stream'
+        raw_mime = info.mimetype if info and hasattr(info, 'mimetype') and info.mimetype else ''
+        mimetype = normalize_mime_type(raw_mime, filename=filename, url=mxc_url)
 
         # Sanitize filename
         safe_event_id = str(event.event_id).replace('$', '').replace(':', '_')[:40]
@@ -585,20 +631,10 @@ class MatrixScribe:
             log_error(f"[matrix-scribe] Media download error: {e}")
             return None
 
-        # Determine file type
-        if mimetype.startswith('image/'):
-            file_type = 'photo'
-        elif mimetype.startswith('video/'):
-            file_type = 'video'
-        elif mimetype.startswith('audio/'):
-            file_type = 'audio'
-        else:
-            file_type = 'document'
-
         return {
             'url': http_url,
             'filename': filename,
-            'type': file_type,
+            'type': mimetype,
             'local_path': local_path,
             'mimetype': mimetype,
         }

@@ -531,20 +531,9 @@ class StoatchatPilgrim:
 
             new_text = data.get('new_text') or ''
 
+            # Only act when explicitly addressed. Looking up via a sibling
+            # target's message_id causes one edit per sibling platform.
             stoatchat_id = data.get('stoatchat_message_id')
-            if not stoatchat_id:
-                source = data.get('source', '')
-                msg_id = data.get('message_id')
-                if not msg_id:
-                    for key in data:
-                        if key.endswith('_message_id') and key != 'stoatchat_message_id':
-                            msg_id = data[key]
-                            if not source:
-                                source = key.replace('_message_id', '')
-                            break
-                if source and msg_id:
-                    stoatchat_id = db.get_mapped_id(source, str(msg_id), 'stoatchat')
-
             if not stoatchat_id:
                 return
 
@@ -622,20 +611,9 @@ class StoatchatPilgrim:
             if not db:
                 return
 
+            # Only act when explicitly addressed. Looking up via a sibling
+            # target's message_id causes one delete per sibling platform.
             stoatchat_id = data.get('stoatchat_message_id')
-            if not stoatchat_id:
-                source = data.get('source', '')
-                msg_id = data.get('message_id')
-                if not msg_id:
-                    for key in data:
-                        if key.endswith('_message_id') and key != 'stoatchat_message_id':
-                            msg_id = data[key]
-                            if not source:
-                                source = key.replace('_message_id', '')
-                            break
-                if source and msg_id:
-                    stoatchat_id = db.get_mapped_id(source, str(msg_id), 'stoatchat')
-
             if not stoatchat_id:
                 return
 

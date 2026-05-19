@@ -17,6 +17,7 @@ if _root not in sys.path:
 from postkeep.papyrus import (
     log_info, log_error, log_warn, log_success, log_debug,
     BridgeMessage, make_direction, get_file_type_from_url,
+    normalize_mime_type,
 )
 
 
@@ -308,26 +309,11 @@ class MatrixPilgrim:
         # ── System messages ──
         is_system = bridge_msg.metadata and bridge_msg.metadata.get('is_system_message')
 
-        # ── Attachments ──
-        if bridge_msg.attachments:
-            for i, att in enumerate(bridge_msg.attachments):
-                media_content = await self._build_media_content(att, client)
-                if media_content:
-                    # Add reply to first message only
-                    if i == 0 and relates_to:
-                        media_content.relates_to = relates_to
-
-                    eid = await client.send_message_event(
-                        room_id, EventType.ROOM_MESSAGE, media_content
-                    )
-                    eid_str = str(eid)
-                    self._recently_sent_event_ids.append(eid_str)
-                    if i == 0:
-                        sent_event_id = eid_str
-
-        # ── Text content ──
         text = bridge_msg.content
-        if text or (is_system and bridge_msg.content):
+        has_text = bool(text) or (is_system and bridge_msg.content)
+
+        # ── Text content (sent first so the prefix/caption precedes media) ──
+        if has_text:
             # Build plain text body (fallback for clients)
             body = ''
             if prefix and not is_system:
@@ -367,8 +353,8 @@ class MatrixPilgrim:
                 formatted_body=html_body,
             )
 
-            # Only add reply if no attachments were sent (reply goes on first item)
-            if not bridge_msg.attachments and relates_to:
+            # Reply goes on the first event (text, since it's sent before media)
+            if relates_to:
                 text_content.relates_to = relates_to
 
             eid = await client.send_message_event(
@@ -376,8 +362,24 @@ class MatrixPilgrim:
             )
             eid_str = str(eid)
             self._recently_sent_event_ids.append(eid_str)
-            if not sent_event_id:
-                sent_event_id = eid_str
+            sent_event_id = eid_str
+
+        # ── Attachments (sent after text so caption stays on top) ──
+        if bridge_msg.attachments:
+            for i, att in enumerate(bridge_msg.attachments):
+                media_content = await self._build_media_content(att, client)
+                if media_content:
+                    # If there's no text, the first media item carries the reply
+                    if i == 0 and not has_text and relates_to:
+                        media_content.relates_to = relates_to
+
+                    eid = await client.send_message_event(
+                        room_id, EventType.ROOM_MESSAGE, media_content
+                    )
+                    eid_str = str(eid)
+                    self._recently_sent_event_ids.append(eid_str)
+                    if not sent_event_id and i == 0:
+                        sent_event_id = eid_str
 
         # ── Poll rendering (text fallback) ──
         if bridge_msg.poll and not sent_event_id:
@@ -425,16 +427,12 @@ class MatrixPilgrim:
         url = attachment.get('url')
         filename = attachment.get('filename', 'file')
 
-        # Resolve MIME type: try 'mimetype' field first (Matrix scribe sets this),
-        # then 'type' field (other scribes put actual MIME types like 'image/jpeg' here),
-        # then infer from filename extension.
-        mimetype = attachment.get('mimetype') or ''
-        if not mimetype or mimetype == 'application/octet-stream':
-            att_type = attachment.get('type', '')
-            if isinstance(att_type, str) and '/' in att_type:
-                mimetype = att_type
-            else:
-                mimetype = get_file_type_from_url(url or '', filename)
+        # Resolve MIME type: prefer 'mimetype' (Matrix scribe), then 'type' (other
+        # scribes). normalize_mime_type rejects octet-stream / non-MIME values and
+        # falls back to filename inference, so a scribe that hands us junk still
+        # produces something usable here.
+        candidate = attachment.get('mimetype') or attachment.get('type') or ''
+        mimetype = normalize_mime_type(candidate, filename=filename, url=url or '')
 
         # Get file bytes
         file_bytes = None
@@ -509,17 +507,9 @@ class MatrixPilgrim:
         if not mx_cfg or not mx_cfg.cross_edit:
             return
 
-        # Resolve Matrix event ID
+        # Only act when explicitly addressed. Looking up via a sibling
+        # target's message_id causes one edit per sibling platform.
         mx_event_id = data.get('matrix_message_id')
-        if not mx_event_id:
-            source = data.get('source', '')
-            for key, val in data.items():
-                if key.endswith('_message_id') and key != 'matrix_message_id':
-                    db = self.core.bridge_dbs.get(bridge_name)
-                    if db:
-                        platform = key.replace('_message_id', '')
-                        mx_event_id = db.get_mapped_id(platform, val, 'matrix')
-                    break
         if not mx_event_id:
             return
 
@@ -581,16 +571,9 @@ class MatrixPilgrim:
         if not mx_cfg or not mx_cfg.cross_delete:
             return
 
-        # Resolve Matrix event ID
+        # Only act when explicitly addressed. Looking up via a sibling
+        # target's message_id causes one redaction per sibling platform.
         mx_event_id = data.get('matrix_message_id')
-        if not mx_event_id:
-            for key, val in data.items():
-                if key.endswith('_message_id') and key != 'matrix_message_id':
-                    db = self.core.bridge_dbs.get(bridge_name)
-                    if db:
-                        platform = key.replace('_message_id', '')
-                        mx_event_id = db.get_mapped_id(platform, val, 'matrix')
-                    break
         if not mx_event_id:
             return
 

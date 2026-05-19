@@ -303,6 +303,23 @@ class TelegramPilgrim:
                 return
 
             edit_applied = False
+            last_error_msg = ''
+            # Telegram errors that mean "this edit is a no-op or impossible"
+            # and emphatically should NOT trigger a fallback [Edited] reply.
+            # Pasting a duplicate notification into the chat for these would
+            # be pure noise. They cover: identical content, target deleted,
+            # target too old, target is a non-editable system/service msg.
+            _BENIGN_ERRS = (
+                'message is not modified',
+                "message can't be edited",
+                'message to edit not found',
+                'there is no text in the message to edit',
+                'message_id_invalid',
+            )
+
+            def _is_benign(err) -> bool:
+                s = str(err).lower()
+                return any(token in s for token in _BENIGN_ERRS)
 
             async def _try_edit_text():
                 return await self.bot.edit_message_text(
@@ -326,6 +343,7 @@ class TelegramPilgrim:
                     edit_applied = True
                     break
                 except Exception as _e:
+                    last_error_msg = str(_e)
                     if (isinstance(_e, asyncio.TimeoutError) or 'Timed out' in str(_e)) and attempt == 0:
                         await asyncio.sleep(0.5)
                         continue
@@ -338,22 +356,28 @@ class TelegramPilgrim:
                         edit_applied = True
                         break
                     except Exception as _e2:
+                        last_error_msg = str(_e2)
                         if (isinstance(_e2, asyncio.TimeoutError) or 'Timed out' in str(_e2)) and attempt == 0:
                             await asyncio.sleep(0.5)
                             continue
                         break
 
             if not edit_applied:
-                try:
-                    await self.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"[Edited]\n{new_text}",
-                        parse_mode=constants.ParseMode.HTML,
-                        reply_to_message_id=msg_id
-                    )
-                    edit_applied = True
-                except Exception as _e3:
-                    log_error(f"Failed to edit Telegram message: {_e3}")
+                if _is_benign(last_error_msg):
+                    # Silent skip - the user doesn't need to know we tried
+                    # to no-op an already-up-to-date or too-old message.
+                    log_debug(f"Skipped fallback [Edited] reply ({last_error_msg})", 'telegram_pilgrim')
+                else:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"[Edited]\n{new_text}",
+                            parse_mode=constants.ParseMode.HTML,
+                            reply_to_message_id=msg_id
+                        )
+                        edit_applied = True
+                    except Exception as _e3:
+                        log_error(f"Failed to edit Telegram message: {_e3}")
 
             if edit_applied:
                 self._last_edit_cache[msg_id] = new_text

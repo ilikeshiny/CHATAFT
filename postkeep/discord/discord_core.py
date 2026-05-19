@@ -1,6 +1,3 @@
-import discord
-from discord.ext import commands
-from discord import Webhook
 import asyncio
 import pika
 import json
@@ -43,18 +40,43 @@ class DiscordCore:
         self.settings = load_global_settings(CONFIG_PATH, 'discord_bot')
         self.enable_history_parsing = bool(self.settings.get('ENABLE_HISTORY_PARSING', False))
         self.tenor_preferred_format = str(self.settings.get('TENOR_PREFERRED_FORMAT', 'gif')).lower()
+        _mode_raw = self.settings.get('DISCORD_MODE', None)
+        log_info(f"DISCORD_MODE config read: raw={_mode_raw!r}")
+        self.mode = str(_mode_raw or 'bot').strip().lower()
+        if self.mode not in ('bot', 'clientbot'):
+            log_warn(f"Unknown DISCORD_MODE '{self.mode}', defaulting to 'bot'")
+            self.mode = 'bot'
         self.bridges = self._build_bridges_from_gateways()
         self.bridge_dbs: Dict[str, BridgeDatabase] = {}
 
         self._init_citadel()
 
-        intents = discord.Intents.default()
-        intents.messages = True
-        intents.message_content = True
-        intents.dm_messages = True
-        intents.guild_messages = True
-        intents.members = True
-        self.bot = commands.Bot(command_prefix="!", intents=intents)
+        if self.mode == 'clientbot':
+            try:
+                import selfcord
+            except ImportError:
+                raise RuntimeError(
+                    "DISCORD_MODE=clientbot requires discord.py-self installed into the venv's "
+                    "site-packages and renamed to 'selfcord'. See setup docs for the install recipe."
+                )
+            self.discord_lib = selfcord
+            self.bot = selfcord.Client()
+            log_error("====================================================================")
+            log_error(" DISCORD MODE: CLIENTBOT (selfcord / discord.py-self)")
+            log_error(" User-account automation violates Discord ToS - account ban risk.")
+            log_error("====================================================================")
+        else:
+            import discord
+            from discord.ext import commands
+            self.discord_lib = discord
+            log_info("Discord mode: BOT (discord.py)")
+            intents = discord.Intents.default()
+            intents.messages = True
+            intents.message_content = True
+            intents.dm_messages = True
+            intents.guild_messages = True
+            intents.members = True
+            self.bot = commands.Bot(command_prefix="!", intents=intents)
 
         self.rabbitmq_connection = None
         self.rabbitmq_channel = None
@@ -431,12 +453,16 @@ if __name__ == '__main__':
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
-    from postkeep.discord.discord_scribe import DiscordScribe
     from postkeep.discord.discord_pilgrim import DiscordPilgrim
 
     core = DiscordCore()
 
-    scribe = DiscordScribe(core)
+    if core.mode == 'clientbot':
+        from postkeep.discord.discord_clientbot_scribe import DiscordClientbotScribe
+        scribe = DiscordClientbotScribe(core)
+    else:
+        from postkeep.discord.discord_scribe import DiscordScribe
+        scribe = DiscordScribe(core)
     pilgrim = DiscordPilgrim(core)
 
     core._pilgrim_ref = pilgrim

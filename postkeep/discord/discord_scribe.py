@@ -1,4 +1,3 @@
-import discord
 import asyncio
 import io
 import json
@@ -15,21 +14,41 @@ from postkeep.papyrus import (
     log_info, log_error, log_warn, log_success, log_debug,
     BridgeMessage,
     extract_media_urls, extract_tenor_urls, escape_discord_emojis,
-    convert_video_to_gif, get_file_type_from_url,
+    convert_video_to_gif, get_file_type_from_url, normalize_mime_type,
     should_skip_download, extract_ignore_hint_urls,
     is_user_ignored, add_ignored_user, is_user_admin,
     add_downloadable_domain, add_ignored_domain,
     get_cached_avatar, store_avatar_cache, compute_avatar_hash,
     AVATAR_REFRESH_INTERVAL,
+    get_privacy_level, set_privacy_level, list_privacy_settings,
+    get_privacy_limit, cap_privacy_level,
+    format_privacy_levels_token, format_privacy_levels_help,
+    format_privacy_levels_phrase,
+    compute_incognito_name, ensure_incognito_avatar,
+    apply_link_replacements, is_privacy_active,
 )
+
+
+# Pre-compiled match for the privacy command. Used to gate dispatch in
+# on_message and to defensively skip command messages in process_discord_message
+# (catch-up paths bypass on_message and would otherwise bridge it).
+_PRIVACY_CMD_RE = re.compile(r'^-{1,2}privacy(\s|$)')
 
 
 class DiscordScribe:
     def __init__(self, core):
         self.core = core
         self.bot = core.bot
+        self._dlib = core.discord_lib
         self.component_name = 'discord_scribe'
         self._bridge_locks: Dict[str, asyncio.Lock] = {}
+
+        # Cache: is privacy reachable on any bridge? When False we skip the
+        # -privacy command dispatch AND every per-message privacy check.
+        # Refreshed by core.reload_config when implemented; safe default is to
+        # recompute on demand if bridges change at runtime.
+        bridges = getattr(core, 'bridges', None)
+        self._privacy_active = is_privacy_active(bridges) if bridges else False
 
     def setup_handlers(self):
         @self.bot.event
@@ -64,10 +83,21 @@ class DiscordScribe:
 
         @self.bot.event
         async def on_message(message):
-            if isinstance(message.channel, discord.DMChannel):
+            # Privacy command works in DMs too (for setting per-channel privacy remotely).
+            if isinstance(message.channel, self._dlib.DMChannel):
+                if (
+                    self._privacy_active
+                    and not message.author.bot
+                    and _PRIVACY_CMD_RE.match(message.content.strip())
+                    # When the global cap is 0 we silently ignore the command
+                    # even in DMs, no matter what per-bridge overrides say -
+                    # the global setting is the kill switch.
+                    and get_privacy_limit() > 0
+                ):
+                    await self._cmd_privacy(message)
                 return
 
-            if message.type == discord.MessageType.new_member:
+            if message.type == self._dlib.MessageType.new_member:
                 await self.handle_system_join(message)
                 return
 
@@ -75,7 +105,7 @@ class DiscordScribe:
             # that would otherwise fall through to process_discord_message with empty
             # content and produce "This format is not supported".
             # Only process regular messages and replies (forwards use type default).
-            if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            if message.type not in (self._dlib.MessageType.default, self._dlib.MessageType.reply):
                 return
 
             if not message.author.bot:
@@ -90,6 +120,23 @@ class DiscordScribe:
                     return
                 if message.content.strip().startswith('-add_ignored_domain'):
                     await self._cmd_add_ignored_domain(message)
+                    return
+                if self._privacy_active and _PRIVACY_CMD_RE.match(message.content.strip()):
+                    # Global cap of 0 = the feature is off everywhere. Per-bridge
+                    # overrides don't bring back the command in that case.
+                    if get_privacy_limit() <= 0:
+                        return
+                    # Only react in channels the bot is bridging. Outside of a
+                    # bridged channel the bot has no business listening - no
+                    # error, no help text, just silence.
+                    bridge_name, bridge_cfg = self.core.get_bridge_by_discord_channel(message.channel.id)
+                    if not bridge_cfg:
+                        return
+                    # When the effective cap on this channel is 0 (per-bridge
+                    # override), behave as if the command doesn't exist.
+                    if get_privacy_limit('discord', bridge_cfg) <= 0:
+                        return
+                    await self._cmd_privacy(message)
                     return
 
             if not message.author.bot:
@@ -179,7 +226,7 @@ class DiscordScribe:
                                    discord_url=direct_url)
                 return direct_url
 
-            file = discord.File(io.BytesIO(avatar_bytes), filename=f"avatar_{user_id}.png")
+            file = self._dlib.File(io.BytesIO(avatar_bytes), filename=f"avatar_{user_id}.png")
             msg = await upload_channel.send(file=file)
             if msg.attachments:
                 avatar_url = str(msg.attachments[0].url)
@@ -281,7 +328,7 @@ class DiscordScribe:
             log_warn(f"[AVATAR-REFRESH] No upload channel for re-upload of {user_id}", self.component_name)
             return
 
-        file = discord.File(io.BytesIO(avatar_bytes), filename=f"avatar_{user_id}.png")
+        file = self._dlib.File(io.BytesIO(avatar_bytes), filename=f"avatar_{user_id}.png")
         msg = await upload_channel.send(file=file)
         if msg.attachments:
             new_url = str(msg.attachments[0].url)
@@ -374,6 +421,129 @@ class DiscordScribe:
             await message.channel.send('Discord config reloaded', reference=message)
         except Exception as e:
             await message.channel.send(f"Reload failed: {e}")
+
+    async def _cmd_privacy(self, message):
+        try:
+            user_id = message.author.id
+            chan_id = message.channel.id
+            is_dm = isinstance(message.channel, self._dlib.DMChannel)
+
+            text = message.content.strip()
+            text = re.sub(r'^-{1,2}privacy\s*', '', text)
+            parts = text.split() if text else []
+
+            async def _send(t):
+                try:
+                    if is_dm:
+                        await message.channel.send(t)
+                    else:
+                        await message.channel.send(t, reference=message)
+                except Exception:
+                    pass
+
+            # Resolve the bridge (best effort, by current channel_id) up front so
+            # help text and validation reflect the actual per-bridge cap.
+            def _bridge_for_chan(cid):
+                try:
+                    cid_int = int(cid)
+                except Exception:
+                    return None
+                for _bn, _bcfg in self.core.bridges.items():
+                    _ds = _bcfg.get_platform('discord')
+                    if _ds and _ds.channel_id_int == cid_int:
+                        return _bcfg
+                return None
+
+            current_bridge = None if is_dm else _bridge_for_chan(chan_id)
+            limit = get_privacy_limit('discord', current_bridge)
+            level_token = format_privacy_levels_token(limit)
+            level_phrase = format_privacy_levels_phrase(limit)
+            level_help = format_privacy_levels_help(limit)
+            invalid_msg = f"Level must be {level_phrase}."
+
+            if not parts:
+                settings = list_privacy_settings('discord', user_id)
+                if settings:
+                    lines = []
+                    for scope, lvl in settings:
+                        eff = min(lvl, limit)
+                        label = {0: 'disabled', 1: 'nickname omitted', 2: 'fully ignored'}[eff]
+                        scope_lbl = 'all channels' if scope == 'all' else f'channel {scope}'
+                        suffix = f" (capped from {lvl})" if eff != lvl else ''
+                        lines.append(f"  {scope_lbl}: {label}{suffix}")
+                    await _send("Your privacy settings:\n" + "\n".join(lines))
+                elif limit <= 0:
+                    await _send("Privacy is disabled on this bridge.")
+                else:
+                    await _send(
+                        "No privacy settings (default: level 0, disabled).\n\n"
+                        "Usage:\n"
+                        f"  -privacy {level_token}               set for this channel\n"
+                        f"  -privacy {level_token} -all          set for every channel\n"
+                        f"  -privacy <channel_id> {level_token}  set for a specific channel\n\n"
+                        f"Levels: {level_help}"
+                    )
+                return
+
+            if limit <= 0:
+                await _send("Privacy is disabled on this bridge.")
+                return
+
+            is_all = '-all' in parts
+            if is_all:
+                parts = [p for p in parts if p != '-all']
+
+            scope = None
+            level = None
+            if len(parts) == 1:
+                try:
+                    level = int(parts[0])
+                except ValueError:
+                    await _send(invalid_msg)
+                    return
+                if is_all:
+                    scope = 'all'
+                elif is_dm:
+                    await _send(
+                        "In DM, use:\n"
+                        "  -privacy <level> -all\n"
+                        "  -privacy <channel_id> <level>"
+                    )
+                    return
+                else:
+                    scope = str(chan_id)
+            elif len(parts) == 2:
+                if is_all:
+                    await _send("Cannot combine explicit channel_id with -all.")
+                    return
+                scope = parts[0]
+                try:
+                    level = int(parts[1])
+                except ValueError:
+                    await _send(invalid_msg)
+                    return
+            else:
+                await _send("Usage: -privacy <level> [-all] or -privacy <channel_id> <level>")
+                return
+
+            scope_bridge = current_bridge if scope == 'all' else _bridge_for_chan(scope)
+            scope_limit = get_privacy_limit('discord', scope_bridge)
+
+            # Out-of-range level (negative, above cap, etc.) -> generic syntax
+            # error using the cap-aware phrase. No dedicated cap message.
+            if level < 0 or level > scope_limit:
+                await _send(f"Level must be {format_privacy_levels_phrase(scope_limit)}.")
+                return
+
+            set_privacy_level('discord', user_id, scope, level)
+            scope_lbl = 'all channels' if scope == 'all' else f'channel {scope}'
+            level_lbl = {0: 'disabled', 1: 'nickname omitted', 2: 'fully ignored'}[level]
+            await _send(f"Privacy for {scope_lbl}: {level_lbl}.")
+        except Exception as e:
+            try:
+                await message.channel.send(f"Privacy command failed: {e}")
+            except Exception:
+                pass
 
     async def _cmd_add_downloadable_domain(self, message):
         try:
@@ -692,7 +862,7 @@ class DiscordScribe:
                         atts.append({
                             'url': primary_url,
                             'filename': ratt.filename,
-                            'type': getattr(ratt, 'content_type', None) or 'application/octet-stream',
+                            'type': normalize_mime_type(getattr(ratt, 'content_type', None), filename=ratt.filename, url=primary_url),
                             'local_path': fp
                         })
             except Exception:
@@ -753,6 +923,28 @@ class DiscordScribe:
         if ds.ignore_webhooks and getattr(message, 'webhook_id', None):
             return
 
+        # Defensive: catch-up paths (process_imports_and_missed) call here
+        # directly, bypassing on_message. Skip privacy commands so they never
+        # bridge regardless of which entrypoint surfaced them.
+        try:
+            content_stripped = (message.content or '').strip()
+            if content_stripped and _PRIVACY_CMD_RE.match(content_stripped):
+                return
+        except Exception:
+            pass
+
+        privacy_level = 0
+        if self._privacy_active:
+            privacy_level = get_privacy_level(
+                'discord', message.author.id, message.channel.id, bridge=bridge_config
+            )
+            if privacy_level >= 2:
+                log_debug(
+                    f"Privacy level 2: dropping msg={message.id} from user {message.author.id}",
+                    self.component_name
+                )
+                return
+
         # Track native Discord message timestamp for prefix collapse
         self.core._last_native_dc_msg[bridge_name] = time.time()
 
@@ -779,13 +971,45 @@ class DiscordScribe:
         allow_external_emojis = True
         allow_external_stickers = True
         try:
-            if getattr(message, 'guild', None) and hasattr(message.channel, 'permissions_for'):
-                perms = message.channel.permissions_for(message.author)
+            guild = getattr(message, 'guild', None)
+            if guild and hasattr(message.channel, 'permissions_for'):
+                author = message.author
+                # permissions_for(User) only sees @everyone overwrites; role-based perms
+                # (which most servers use to gate embed_links) are missed. Promote to Member
+                # whenever possible so the check is accurate.
+                Member = getattr(self._dlib, 'Member', None)
+                if Member is not None and not isinstance(author, Member):
+                    member = guild.get_member(author.id)
+                    if member is None:
+                        try:
+                            member = await guild.fetch_member(author.id)
+                        except Exception as fetch_err:
+                            log_debug(
+                                f"[PERMS] fetch_member failed for {author.id}: "
+                                f"{type(fetch_err).__name__}: {fetch_err}",
+                                self.component_name
+                            )
+                            member = None
+                    if member is not None:
+                        author = member
+                perms = message.channel.permissions_for(author)
                 allow_embeds = getattr(perms, 'embed_links', True)
                 allow_external_emojis = getattr(perms, 'use_external_emojis', True)
                 allow_external_stickers = getattr(perms, 'use_external_stickers', True)
-        except Exception:
-            pass
+                log_debug(
+                    f"[PERMS] author={getattr(author, 'name', author)} "
+                    f"type={type(author).__name__} "
+                    f"embed_links={allow_embeds} "
+                    f"ext_emojis={allow_external_emojis} "
+                    f"ext_stickers={allow_external_stickers}",
+                    self.component_name
+                )
+        except Exception as e:
+            log_warn(
+                f"[PERMS] resolution failed for msg={message.id}: "
+                f"{type(e).__name__}: {e}",
+                self.component_name
+            )
 
         sticker_atts = await self._collect_stickers(getattr(message, 'stickers', None), allow_external_stickers)
         for att in sticker_atts:
@@ -880,7 +1104,7 @@ class DiscordScribe:
                                     attachments.append({
                                         'url': u,
                                         'filename': fn,
-                                        'type': att.get('content_type') or 'application/octet-stream',
+                                        'type': normalize_mime_type(att.get('content_type'), filename=fn, url=u),
                                         'local_path': fp
                                     })
                                     consumed_urls.append(u)
@@ -955,7 +1179,7 @@ class DiscordScribe:
                 att_dict = {
                     'url': primary_url,
                     'filename': attachment.filename,
-                    'type': attachment.content_type or 'application/octet-stream',
+                    'type': normalize_mime_type(attachment.content_type, filename=attachment.filename, url=primary_url),
                     'local_path': file_path
                 }
                 if attachment.is_spoiler():
@@ -1124,7 +1348,7 @@ class DiscordScribe:
         # Forward detection: Discord forwards have type=default, a reference,
         # but empty content on the outer message. If we haven't already resolved
         # the referenced content (e.g. raw data wasn't available), fetch it now.
-        if (message.type == discord.MessageType.default
+        if (message.type == self._dlib.MessageType.default
                 and message.reference and message.reference.message_id
                 and not same_server_ref
                 and not (message.content or '').strip()
@@ -1169,13 +1393,18 @@ class DiscordScribe:
             content = f"{content} {extra}".strip()
 
         try:
+            emoji_mode = getattr(ds, 'custom_emoji', 0)
             emoji_matches = re.findall(r"<:([a-zA-Z0-9_~]+):(\d+)>", content or '')
             for ename, eid in emoji_matches:
-                content = content.replace(f"<:{ename}:{eid}>", f":{ename}:")
+                tag = f"<:{ename}:{eid}>"
+                if emoji_mode == 2:
+                    content = content.replace(tag, '')
+                else:
+                    content = content.replace(tag, f":{ename}:")
                 emoji_url = f"https://cdn.discordapp.com/emojis/{eid}.webp"
                 seen_urls.add(emoji_url)
                 consumed_urls.append(emoji_url)
-                if allow_external_emojis:
+                if emoji_mode == 0 and allow_external_emojis:
                     fp = await self.core.download_media(emoji_url, f"{ename}.webp")
                     if fp:
                         attachments.append({'url': emoji_url, 'filename': f"{ename}.webp", 'type': 'image/webp', 'local_path': fp})
@@ -1219,15 +1448,29 @@ class DiscordScribe:
         if not attachments and not (content or '').strip():
             content = "This format is not supported"
 
+        content = apply_link_replacements(content)
+
         try:
-            await self._resolve_and_cache_discord_avatar(message.author)
+            if privacy_level == 1:
+                effective_author_name = compute_incognito_name(
+                    message.channel.id, message.author.id
+                )
+                bg = self.core.settings.get('INCOGNITO_AVATAR_BG', 'transparent')
+                effective_author_id = ensure_incognito_avatar(
+                    self.core.avatar_db, 'discord',
+                    message.channel.id, message.author.id, bg_color=bg,
+                )
+            else:
+                await self._resolve_and_cache_discord_avatar(message.author)
+                effective_author_name = message.author.name
+                effective_author_id = str(message.author.id)
 
             bridge_msg = BridgeMessage(
                 bridge_name=bridge_name,
                 message_id=str(message.id),
                 channel_id=str(message.channel.id),
-                author_name=message.author.name,
-                author_id=str(message.author.id),
+                author_name=effective_author_name,
+                author_id=effective_author_id,
                 content=content,
                 attachments=attachments,
                 reply_to_id=reply_to_id,
@@ -1267,6 +1510,11 @@ class DiscordScribe:
         def norm_text(msg_obj) -> str:
             try:
                 base = escape_discord_emojis(self.core._sanitize_discord_mentions(msg_obj, getattr(msg_obj, 'content', '') or ''))
+                # Strip leading ```ini / ```diff code-block prefix used by the
+                # bot-mode bridge to render source-platform attribution. The
+                # pilgrim's edit cache strips the same way; if we don't match
+                # it here, our own bot edits will echo back through.
+                base = re.sub(r"^```(?:diff|ini)?\s*[\s\S]*?```\s*", "", base, flags=re.M)
                 base = base.replace('\u200b', '').replace('\u200c', '').replace('\xa0', ' ')
                 base = re.sub(r"\s+", " ", base).strip()
                 return base
@@ -1302,32 +1550,52 @@ class DiscordScribe:
             except Exception:
                 pass
 
+            # Pack all target IDs into a single body. Arbiter routes the
+            # one body to each pilgrim queue and each pilgrim picks out
+            # its own *_message_id. Publishing one body per mapping would
+            # send N copies (each routed to N pilgrims = N*N deliveries)
+            # and produce N "discord -> matrix, telegram, stoatchat"
+            # lines in the arbiter log per source edit.
+            edit_msg = {
+                'type': 'edit',
+                'source': 'discord',
+                'bridge_name': bridge_name,
+                'new_text': clean_content,
+                'author_name': after.author.name,
+                'channel_name': channel_name,
+            }
             for platform, platform_id in mappings.items():
-                edit_msg = {
-                    'type': 'edit',
-                    'source': 'discord',
-                    'bridge_name': bridge_name,
-                    f'{platform}_message_id': platform_id,
-                    'new_text': clean_content,
-                    'author_name': after.author.name,
-                    'channel_name': channel_name,
-                }
-                self.core._safe_publish(self.core.queues['scribe_discord'], json.dumps(edit_msg))
+                edit_msg[f'{platform}_message_id'] = platform_id
+            self.core._safe_publish(self.core.queues['scribe_discord'], json.dumps(edit_msg))
 
     async def handle_message_delete(self, message):
         bridge_name, bridge_config = self.core.get_bridge_by_discord_channel(message.channel.id)
         if not bridge_config or not self._can_forward_to_others(bridge_config):
             return
 
+        # Best-effort author of the deleted message. on_message_delete only
+        # fires for cached messages, so message.author is normally present.
+        # Use .name (internal username) to match what normal messages and
+        # edits send - .display_name is the per-server nickname.
+        author_obj = getattr(message, 'author', None)
+        author_name = (
+            getattr(author_obj, 'name', None)
+            or getattr(author_obj, 'display_name', None)
+            or ''
+        )
+
         db = self.core.bridge_dbs[bridge_name]
         mappings = db.get_all_mappings('discord', str(message.id))
-        for platform, platform_id in mappings.items():
+        if mappings:
+            # Single body with all target IDs (see edit handler for why).
             delete_msg = {
                 'type': 'delete',
                 'source': 'discord',
                 'bridge_name': bridge_name,
-                f'{platform}_message_id': platform_id
+                'author_name': author_name,
             }
+            for platform, platform_id in mappings.items():
+                delete_msg[f'{platform}_message_id'] = platform_id
             self.core._safe_publish(self.core.queues['scribe_discord'], json.dumps(delete_msg))
 
     async def handle_pin_update(self, channel, last_pin):
@@ -1344,7 +1612,7 @@ class DiscordScribe:
                 try:
                     if channel.guild:
                         now = datetime.now(timezone.utc)
-                        async for entry in channel.guild.audit_logs(action=discord.AuditLogAction.message_pin, limit=5):
+                        async for entry in channel.guild.audit_logs(action=self._dlib.AuditLogAction.message_pin, limit=5):
                             if (hasattr(entry, 'extra') and entry.extra
                                     and getattr(entry.extra, 'message_id', None) == latest_pin.id):
                                 if (now - entry.created_at).total_seconds() < 30:
@@ -1559,7 +1827,7 @@ class DiscordScribe:
 
                 history_params = {'limit': None, 'oldest_first': True}
                 if last_processed > 0:
-                    history_params['after'] = discord.Object(id=last_processed)
+                    history_params['after'] = self._dlib.Object(id=last_processed)
 
                 try:
                     channel = self.bot.get_channel(bridge_channel_id) or await self.bot.fetch_channel(bridge_channel_id)

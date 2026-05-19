@@ -23,6 +23,5 @@ rich
 colorama
 
 # file processing 
-gifsicle # (optional)
 ffmpeg
 ffprobe

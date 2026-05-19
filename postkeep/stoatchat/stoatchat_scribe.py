@@ -16,6 +16,8 @@ from postkeep.papyrus import (
     is_user_ignored,
     get_cached_avatar, store_avatar_cache, compute_avatar_hash,
     AVATAR_REFRESH_INTERVAL,
+    apply_link_replacements,
+    normalize_mime_type,
 )
 
 CDN_BASE = 'https://cdn.stoatusercontent.com'
@@ -154,15 +156,13 @@ class StoatchatScribe:
 
                     file_path = await self.core.download_media(att_url, att_filename)
                     if file_path:
-                        is_image = att_filename.lower().endswith(IMAGE_EXTENSIONS) if att_filename else False
                         content_type = getattr(att, 'content_type', None) or getattr(att, 'metadata', {}).get('type', '')
-                        if isinstance(content_type, str) and content_type.startswith('image'):
-                            is_image = True
+                        att_mime = normalize_mime_type(content_type, filename=att_filename, url=att_url)
 
                         attachments.append({
                             'url': att_url,
                             'filename': att_filename,
-                            'type': 'photo' if is_image else 'document',
+                            'type': att_mime,
                             'local_path': file_path,
                         })
                         seen_urls.add(att_url)
@@ -204,6 +204,8 @@ class StoatchatScribe:
 
         if not attachments and not (content or '').strip():
             content = "This format is not supported"
+
+        content = apply_link_replacements(content)
 
         await self._cache_stoatchat_avatar(message)
 
@@ -309,16 +311,21 @@ class StoatchatScribe:
                 pass
 
             mappings = db.get_all_mappings('stoatchat', message_id)
-            for platform, platform_id in mappings.items():
+            if mappings:
+                # Single body with all target IDs - arbiter routes once
+                # per target queue, each pilgrim picks out its own
+                # *_message_id. Publishing one body per mapping multiplies
+                # arbiter log lines and RabbitMQ traffic by len(mappings).
                 edit_msg = {
                     'type': 'edit',
                     'source': 'stoatchat',
                     'bridge_name': bridge_name,
-                    f'{platform}_message_id': platform_id,
                     'new_text': new_content,
                     'author_name': author_name,
                     'channel_name': channel_name,
                 }
+                for platform, platform_id in mappings.items():
+                    edit_msg[f'{platform}_message_id'] = platform_id
                 self.core._safe_publish(self.core.queues['scribe_stoatchat'], json.dumps(edit_msg))
 
         except Exception as e:
@@ -342,14 +349,33 @@ class StoatchatScribe:
             if not db:
                 return
 
+            # Stoatchat delete events don't carry actor info on the event
+            # itself - best effort defensive lookup, falls back to empty.
+            actor_id = (
+                getattr(event, 'user_id', None)
+                or getattr(event, 'author_id', None)
+                or getattr(event, 'deleted_by', None)
+                or ''
+            )
+            actor_name = ''
+            if actor_id:
+                try:
+                    user = await self.client.fetch_user(str(actor_id))
+                    actor_name = getattr(user, 'display_name', None) or getattr(user, 'username', None) or str(actor_id)
+                except Exception:
+                    actor_name = str(actor_id)
+
             mappings = db.get_all_mappings('stoatchat', message_id)
-            for platform, platform_id in mappings.items():
+            if mappings:
+                # Single body with all target IDs (see edit handler for why).
                 delete_msg = {
                     'type': 'delete',
                     'source': 'stoatchat',
                     'bridge_name': bridge_name,
-                    f'{platform}_message_id': platform_id,
+                    'author_name': actor_name,
                 }
+                for platform, platform_id in mappings.items():
+                    delete_msg[f'{platform}_message_id'] = platform_id
                 self.core._safe_publish(self.core.queues['scribe_stoatchat'], json.dumps(delete_msg))
 
         except Exception as e:

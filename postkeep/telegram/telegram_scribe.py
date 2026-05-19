@@ -8,7 +8,7 @@ from html import escape as html_escape
 from typing import Optional, Dict, TYPE_CHECKING
 
 from telegram import Update, constants
-from telegram.ext import MessageHandler, filters, ContextTypes
+from telegram.ext import MessageHandler, filters, ContextTypes, ApplicationHandlerStop
 
 from postkeep.papyrus import (
     ARBITER_QUEUES, apply_namespace, get_namespace,
@@ -17,6 +17,13 @@ from postkeep.papyrus import (
     escape_discord_emojis, is_user_ignored, add_ignored_user, is_user_admin,
     get_cached_avatar, store_avatar_cache, compute_avatar_hash,
     AVATAR_REFRESH_INTERVAL,
+    get_privacy_level, set_privacy_level, list_privacy_settings,
+    get_privacy_limit, cap_privacy_level,
+    format_privacy_levels_token, format_privacy_levels_help,
+    format_privacy_levels_phrase,
+    compute_incognito_name, ensure_incognito_avatar,
+    apply_link_replacements, is_privacy_active,
+    normalize_mime_type,
 )
 
 if TYPE_CHECKING:
@@ -56,6 +63,11 @@ class TelegramScribe:
 
         # Track chats we already attempted to leave so we don't spam the API
         self._left_chats: set = set()
+
+        # Cache: is privacy reachable on any bridge? When False we skip the
+        # /privacy handler registration AND every per-message privacy check.
+        # Refreshed by core.reload_config().
+        self._privacy_active = is_privacy_active(core.bridges)
 
         ns = core._namespace
         queues = apply_namespace(ARBITER_QUEUES, ns)
@@ -146,6 +158,12 @@ class TelegramScribe:
         self.app.add_handler(MessageHandler(
             filters.TEXT & filters.Regex(r'^-reloadconfig'), self.handle_reload
         ), 0)
+        if self._privacy_active:
+            self.app.add_handler(MessageHandler(
+                filters.COMMAND & filters.Regex(r'^/privacy(\s|$|@)'), self.handle_privacy
+            ), 0)
+        else:
+            log_info("Privacy is fully disabled; skipping /privacy handler registration.", 'telegram_scribe')
 
         self.app.add_handler(MessageHandler(
             filters.ALL & ~filters.UpdateType.EDITED, self.handle_message
@@ -551,6 +569,25 @@ class TelegramScribe:
         bridge_name, bridge_config = self.get_bridge_by_telegram_message(message)
 
         if not bridge_name or not bridge_config:
+            chat_type = getattr(getattr(message, 'chat', None), 'type', None)
+
+            # Private chat (DM with bot): can't leave, show info message instead.
+            if chat_type == 'private':
+                if chat_id and chat_id not in self._left_chats:
+                    self._left_chats.add(chat_id)
+                    info_msg = self.core.settings.get(
+                        'TG_PRIVATE_CHAT_MESSAGE',
+                        "👋 Hi! I'm a CHATAFT bridge bot and I don't operate in private messages. "
+                        "Visit the project page for more info: "
+                        "https://github.com/ilikeshiny/CHATAFT/"
+                    )
+                    try:
+                        if info_msg:
+                            await context.bot.send_message(chat_id=chat_id, text=info_msg)
+                    except Exception as e:
+                        log_debug(f"Could not send private chat info to {chat_id}: {e}", 'telegram_scribe')
+                return
+
             if chat_id and chat_id not in self._configured_chat_ids and chat_id not in self._left_chats:
                 log_warn(f"Unconfigured chat {chat_id}; attempting to leave.", 'telegram_scribe')
                 self._left_chats.add(chat_id)
@@ -737,6 +774,7 @@ class TelegramScribe:
                 f"display_name={display_name!r}",
                 'telegram_scribe'
             )
+            resolved_admin_user_id = None
             if signature and prefer_chat_avatar and sig_mode > 0:
                 try:
                     chat_id_for_admins = message.sender_chat.id if message.sender_chat else message.chat.id
@@ -749,9 +787,44 @@ class TelegramScribe:
                             # Mode 1 or human in mode 2: use admin's avatar
                             entity_id = int(admin_user.id)
                             prefer_chat_avatar = False
+                            resolved_admin_user_id = int(admin_user.id)
                             log_debug(f"[SIG] Resolved '{signature}' → user {entity_id}", 'telegram_scribe')
                 except Exception as e:
                     log_warn(f"[SIG] Signature resolution failed: {e}", 'telegram_scribe')
+
+            # ── privacy (after signature resolution so channel posts route to admin) ──
+            # Use the actual user identity: from_user for normal posts, the resolved
+            # admin user_id for signed channel posts. Anonymous group admins / unresolved
+            # signatures don't have a real user_id and therefore can't be matched.
+            effective_user_id = None
+            if message.from_user:
+                effective_user_id = message.from_user.id
+            elif resolved_admin_user_id is not None:
+                effective_user_id = resolved_admin_user_id
+
+            if effective_user_id is not None and self._privacy_active:
+                privacy_level = get_privacy_level(
+                    'telegram', effective_user_id, message.chat_id,
+                    bridge=bridge_config,
+                )
+                if privacy_level >= 2:
+                    log_debug(
+                        f"Privacy level 2: dropping msg={message.message_id} "
+                        f"from user {effective_user_id}",
+                        'telegram_scribe'
+                    )
+                    return
+                if privacy_level == 1:
+                    display_name = compute_incognito_name(message.chat_id, effective_user_id)
+                    # Generate (or reuse) a deterministic identicon, then route
+                    # avatar lookups through the synthetic incognito ID so we
+                    # don't leak the real user's avatar.
+                    bg = self.core.settings.get('INCOGNITO_AVATAR_BG', 'transparent')
+                    entity_id = ensure_incognito_avatar(
+                        self.core.avatar_db, 'telegram',
+                        message.chat_id, effective_user_id, bg_color=bg,
+                    )
+                    prefer_chat_avatar = False
 
             db_lookup = self.core.bridge_dbs.get(bridge_name)
             if db_lookup is None:
@@ -838,9 +911,11 @@ class TelegramScribe:
                             await file.download_to_drive(local_path)
 
                         if os.path.exists(local_path):
-                            att_mime = getattr(actual_media, 'mime_type', 'application/octet-stream')
+                            raw_mime = getattr(actual_media, 'mime_type', None)
                             if is_static_sticker:
                                 att_mime = 'image/webp'
+                            else:
+                                att_mime = normalize_mime_type(raw_mime, filename=filename)
                             attachments.append({
                                 'url': '', 'filename': filename,
                                 'type': att_mime,
@@ -891,9 +966,10 @@ class TelegramScribe:
                                 elocal = os.path.join(cache_dir, f"tgb_{extra_msg.chat_id}_{extra_msg.message_id}_{efname}")
                                 await efile.download_to_drive(elocal)
                             if os.path.exists(elocal):
+                                extra_raw_mime = getattr(extra_media, 'mime_type', None)
                                 attachments.append({
                                     'url': '', 'filename': efname,
-                                    'type': getattr(extra_media, 'mime_type', 'application/octet-stream'),
+                                    'type': normalize_mime_type(extra_raw_mime, filename=efname),
                                     'local_path': elocal
                                 })
                                 if extra_is_anim:
@@ -925,6 +1001,8 @@ class TelegramScribe:
             if extra_captions:
                 text_content = '\n'.join([text_content] + extra_captions).strip()
 
+            text_content = apply_link_replacements(text_content)
+
             message_metadata = {}
             if is_animation:
                 message_metadata['is_animation'] = True
@@ -944,7 +1022,10 @@ class TelegramScribe:
                     str(m.message_id) for m in extra_media_messages
                 ]
 
-            await self._cache_telegram_avatar(message, entity_id, is_channel=prefer_chat_avatar)
+            # Don't run the Telegram avatar download on synthetic incognito IDs
+            # (they're already populated by ensure_incognito_avatar above).
+            if not (isinstance(entity_id, str) and entity_id.startswith('incognito_')):
+                await self._cache_telegram_avatar(message, entity_id, is_channel=prefer_chat_avatar)
 
             bridge_msg = BridgeMessage(
                 bridge_name=bridge_name,
@@ -1030,17 +1111,21 @@ class TelegramScribe:
             except Exception:
                 pass
 
+            # Single body with all target IDs - arbiter routes once per
+            # target queue, each pilgrim picks out its own *_message_id.
+            # Publishing one body per mapping would multiply log lines
+            # and RabbitMQ traffic by len(mappings).
+            payload = {
+                'type': 'edit',
+                'source': 'telegram',
+                'bridge_name': bridge_name,
+                'new_text': new_text,
+                'author_name': author_name,
+                'channel_name': channel_name,
+            }
             for platform, platform_id in mappings.items():
-                payload = {
-                    'type': 'edit',
-                    'source': 'telegram',
-                    'bridge_name': bridge_name,
-                    f'{platform}_message_id': str(platform_id),
-                    'new_text': new_text,
-                    'author_name': author_name,
-                    'channel_name': channel_name,
-                }
-                self._safe_publish(self._scribe_queue, json.dumps(payload))
+                payload[f'{platform}_message_id'] = str(platform_id)
+            self._safe_publish(self._scribe_queue, json.dumps(payload))
 
         except Exception as e:
             log_error(f"Failed to handle Telegram edit: {e}")
@@ -1094,6 +1179,144 @@ class TelegramScribe:
             await message.reply_text('User ignored' if added else 'User already ignored')
         except Exception as e:
             await update.effective_chat.send_message(f"Failed to ignore: {e}")
+
+    async def handle_privacy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Outer wrapper guarantees ApplicationHandlerStop ALWAYS fires - even
+        # when the body short-circuits via `return`. Without this split, every
+        # `return` inside the body skipped the trailing raise and the message
+        # would fall through to handle_message in group 1 and get bridged.
+        try:
+            await self._do_handle_privacy(update, context)
+        except ApplicationHandlerStop:
+            raise
+        except Exception as e:
+            try:
+                await update.effective_chat.send_message(f"Privacy command failed: {e}")
+            except Exception:
+                pass
+        # Don't let this message also flow into handle_message and get bridged.
+        raise ApplicationHandlerStop
+
+    async def _do_handle_privacy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.effective_message
+        if not message or not message.from_user:
+            return
+        user_id = message.from_user.id
+        chat_id = message.chat_id
+        chat_type = getattr(getattr(message, 'chat', None), 'type', None)
+
+        # Resolve the bridge (best effort) up front so help text and
+        # validation both reflect the actual per-bridge cap.
+        current_bridge = None
+        try:
+            _bn, current_bridge = self.get_bridge_by_telegram_channel(chat_id)
+        except Exception:
+            current_bridge = None
+        limit = get_privacy_limit('telegram', current_bridge)
+
+        level_token = format_privacy_levels_token(limit)         # e.g. '0|1'
+        level_phrase = format_privacy_levels_phrase(limit)       # e.g. '0 or 1'
+        level_help = format_privacy_levels_help(limit)           # e.g. '0=disabled, 1=omit nickname'
+        invalid_msg = f"Level must be {level_phrase}."
+
+        text = (message.text or '').strip()
+        text = re.sub(r'^/privacy(@\S+)?\s*', '', text)
+        parts = text.split() if text else []
+
+        # No args: show current settings.
+        if not parts:
+            settings = list_privacy_settings('telegram', user_id)
+            if settings:
+                lines = []
+                for scope, lvl in settings:
+                    # Reflect the runtime cap in the listing.
+                    eff = min(lvl, limit)
+                    label = {0: 'disabled', 1: 'nickname omitted', 2: 'fully ignored'}[eff]
+                    scope_lbl = 'all chats' if scope == 'all' else f'chat {scope}'
+                    suffix = f" (capped from {lvl})" if eff != lvl else ''
+                    lines.append(f"  {scope_lbl}: {label}{suffix}")
+                msg_text = "Your privacy settings:\n" + "\n".join(lines)
+            elif limit <= 0:
+                msg_text = "Privacy is disabled on this bridge."
+            else:
+                msg_text = (
+                    "No privacy settings (default: level 0, disabled).\n\n"
+                    "Usage:\n"
+                    f"  /privacy {level_token}            set for this chat\n"
+                    f"  /privacy {level_token} -all       set for every chat\n"
+                    f"  /privacy <chat_id> {level_token}  set for a specific chat\n\n"
+                    f"Levels: {level_help}"
+                )
+            await message.reply_text(msg_text)
+            return
+
+        # If the bridge has privacy disabled outright, refuse early so the
+        # user gets a meaningful answer instead of a confusing range error.
+        if limit <= 0:
+            await message.reply_text("Privacy is disabled on this bridge.")
+            return
+
+        is_all = '-all' in parts
+        if is_all:
+            parts = [p for p in parts if p != '-all']
+
+        scope = None
+        level = None
+        if len(parts) == 1:
+            try:
+                level = int(parts[0])
+            except ValueError:
+                await message.reply_text(invalid_msg)
+                return
+            if is_all:
+                scope = 'all'
+            elif chat_type == 'private':
+                await message.reply_text(
+                    "In DM, use:\n"
+                    "  /privacy <level> -all\n"
+                    "  /privacy <chat_id> <level>"
+                )
+                return
+            else:
+                scope = str(chat_id)
+        elif len(parts) == 2:
+            if is_all:
+                await message.reply_text("Cannot combine explicit chat_id with -all.")
+                return
+            scope = parts[0]
+            try:
+                level = int(parts[1])
+            except ValueError:
+                await message.reply_text(invalid_msg)
+                return
+        else:
+            await message.reply_text(
+                "Usage: /privacy <level> [-all] or /privacy <chat_id> <level>"
+            )
+            return
+
+        # Re-resolve the bridge for the actual scope (might differ from the
+        # current chat) so we apply the right per-bridge cap.
+        scope_bridge = current_bridge
+        if scope != 'all':
+            try:
+                _bn, scope_bridge = self.get_bridge_by_telegram_channel(int(scope))
+            except Exception:
+                pass
+        scope_limit = get_privacy_limit('telegram', scope_bridge)
+
+        # Out-of-range level (negative, above cap, etc.) -> generic syntax
+        # error using the cap-aware phrase. No dedicated cap message.
+        if level < 0 or level > scope_limit:
+            await message.reply_text(
+                f"Level must be {format_privacy_levels_phrase(scope_limit)}."
+            )
+            return
+
+        set_privacy_level('telegram', user_id, scope, level)
+        scope_lbl = 'all chats' if scope == 'all' else f'chat {scope}'
+        level_lbl = {0: 'disabled', 1: 'nickname omitted', 2: 'fully ignored'}[level]
+        await message.reply_text(f"Privacy for {scope_lbl}: {level_lbl}.")
 
     async def handle_reload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
