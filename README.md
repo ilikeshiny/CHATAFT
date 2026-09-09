@@ -34,6 +34,18 @@ Arbiter Live Dashboard Preview
 
 > [!TIP]
 > Changelogs:
+
+<details> <summary>9.9.26 1.2 - QoL</summary> 
+
+- added auto-restarts <br>
+- revamped -restartconfig <br>
+- improvements to embed detection (klipy and youtube should work fine now) <br>
+- imports now self-disable themselves when done to avoid confusion
+- fixed link replacements to be handled post-transform on discord's side
+- sooo many fixes for DB storage cleanups, message mapping deduplications, extended matrix compatibility and many many other little things <br>
+
+this update tackles many issues because i'm not using git repositories as intended and instead upload bulk updates i've been working on for months, so these "1.1, 1.2" actually matter
+
 <details> <summary>5.20.26 1.1</summary> 
     - New arbiter hints and dynamic scaling capabilities <br>
     - Full Discord clientbot functionality added via slim-link file (you must install the lib via the scripts/install_clientbot.sh because discord.py-self mimics discord.py and will replace it instead) <br>
