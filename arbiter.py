@@ -201,43 +201,65 @@ class Arbiter:
             if not parser.has_section('Arbiter'):
                 return defaults
 
-            raw_w = parser.get('Arbiter', 'min_width', fallback='').strip().lower()
+            def _get(key):
+                """Read an [Arbiter] key with any trailing inline comment removed.
+
+                ConfigParser only strips whole-line comments unless it is built
+                with inline_comment_prefixes, so `auto_restart_timer = 72  # hours`
+                came back with the comment attached and failed int() - silently
+                disabling the feature. Stripping is done here rather than on the
+                parser so values that legitimately start with '#' (hex colours in
+                other sections) are unaffected.
+                """
+                raw = parser.get('Arbiter', key, fallback='')
+                for marker in (' #', '\t#', ' ;', '\t;'):
+                    idx = raw.find(marker)
+                    if idx != -1:
+                        raw = raw[:idx]
+                return raw.strip().lower()
+
+            raw_w = _get('min_width')
             if raw_w and raw_w not in ('false', 'no', 'off', '0', ''):
                 try:
                     defaults['min_width'] = int(raw_w)
                 except ValueError:
                     pass
 
-            raw_h = parser.get('Arbiter', 'min_height', fallback='').strip().lower()
+            raw_h = _get('min_height')
             if raw_h and raw_h not in ('false', 'no', 'off', '0', ''):
                 try:
                     defaults['min_height'] = int(raw_h)
                 except ValueError:
                     pass
 
-            raw_pin = parser.get('Arbiter', 'auto_dashboard_pin', fallback='').strip().lower()
+            raw_pin = _get('auto_dashboard_pin')
             if raw_pin in ('false', 'no', 'off', '0'):
                 defaults['auto_dashboard_pin'] = False
             elif raw_pin in ('true', 'yes', 'on', '1', ''):
                 defaults['auto_dashboard_pin'] = True
 
-            raw_hl = parser.get('Arbiter', 'arbiter_headless', fallback='').strip().lower()
+            raw_hl = _get('arbiter_headless')
             if raw_hl in ('true', 'yes', 'on', '1'):
                 defaults['headless'] = True
 
-            # Auto-restart settings. Blank/missing keeps the default above;
-            # invalid integers are ignored silently to avoid breaking startup.
+            # Auto-restart settings. Blank/missing keeps the default above.
+            # A malformed value is reported rather than swallowed: silently
+            # falling back to 0 turns the feature off with no trace, which is
+            # how this went unnoticed.
             for key, fallback_val in (
                 ('auto_restart_timer', defaults['auto_restart_timer']),
                 ('auto_restart_clear_msg', defaults['auto_restart_clear_msg']),
                 ('auto_restart_max_wait', defaults['auto_restart_max_wait']),
             ):
-                raw = parser.get('Arbiter', key, fallback='').strip().lower()
+                raw = _get(key)
                 if raw and raw not in ('false', 'no', 'off', ''):
                     try:
                         defaults[key] = max(0, int(raw))
                     except ValueError:
-                        pass
+                        log_warn(
+                            f"[Arbiter] {key} = '{raw}' is not a number; "
+                            f"using {fallback_val} instead."
+                        )
 
             return defaults
         except Exception:
@@ -830,6 +852,7 @@ class Arbiter:
         try:
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
+            env['BRIDGE_COMPONENT'] = name
             if self._namespace:
                 env['BRIDGE_NS'] = self._namespace
             if self._debug_mode:
@@ -2321,6 +2344,18 @@ class Arbiter:
         # Internally no-ops when auto_restart_timer is 0/blank.
         auto_restart = threading.Thread(target=self._auto_restart_loop, daemon=True)
         auto_restart.start()
+
+        # Daily DB cleanup (message mappings + avatar cache). No-ops if
+        # [Cleanup] enabled=false in codex.ini. Reloads settings on every
+        # tick so config edits take effect without restarting.
+        try:
+            from postkeep.cleanup import start_cleanup_scheduler
+            start_cleanup_scheduler(
+                citadel_root=CITADEL_ROOT,
+                settings_loader=load_global_settings,
+            )
+        except Exception as e:
+            log_warn(f"Could not start cleanup scheduler: {e}")
 
         self.auto_start_components()
 

@@ -11,10 +11,12 @@ from typing import Optional, TYPE_CHECKING
 
 from PIL import Image
 from telegram import InputMediaPhoto, InputMediaVideo, constants
+from telegram.error import RetryAfter
 
 from postkeep.papyrus import (
     ARBITER_QUEUES, apply_namespace, get_namespace,
     log_info, log_error, log_warn, log_success, log_debug,
+    log_transient, is_transient_error,
     BridgeMessage, BridgeDatabase,
     escape_discord_emojis, convert_video_to_gif, discord_snowflake_to_unix,
     ensure_cache_dir, enforce_cache_quota,
@@ -59,6 +61,33 @@ class TelegramPilgrim:
         self._pilgrim_queue = queues.get('pilgrim_telegram', 'pilgrim_telegram')
 
         self._consumer_thread = None
+
+    async def _with_flood_retry(self, send, attempts: int = 4, reset=None):
+        """Run a single Telegram API call, waiting out flood limits.
+
+        Only safe for atomic calls: RetryAfter means Telegram rejected the
+        request outright, so nothing was delivered and a retry cannot
+        duplicate. Without this the send is dropped and its mapping never
+        written, leaving the message to be re-sent by a later catch-up.
+
+        `reset` rewinds any file handle the call uploads from; a retry would
+        otherwise send zero bytes from an already-consumed stream.
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                if reset is not None:
+                    reset()
+                return await send()
+            except RetryAfter as e:
+                if attempt == attempts:
+                    raise
+                wait = float(getattr(e, 'retry_after', 5)) + 1
+                log_warn(
+                    f"Flood control: waiting {wait:.0f}s then retrying "
+                    f"(attempt {attempt}/{attempts})",
+                    'telegram_pilgrim',
+                )
+                await asyncio.sleep(wait)
 
     def _store_mapping(self, db, telegram_msg_id, bridge_msg):
         source = (bridge_msg.source or '').lower()
@@ -659,12 +688,16 @@ class TelegramPilgrim:
                 message_thread_id=topic_id
             )
             try:
-                sent = await self.bot.send_message(**send_kwargs)
+                sent = await self._with_flood_retry(
+                    lambda: self.bot.send_message(**send_kwargs)
+                )
             except Exception as e_text:
                 if 'Message thread not found' in str(e_text):
                     log_warn(f"Topic {topic_id} not found; sending without thread", 'telegram_pilgrim')
                     send_kwargs.pop('message_thread_id', None)
-                    sent = await self.bot.send_message(**send_kwargs)
+                    sent = await self._with_flood_retry(
+                        lambda: self.bot.send_message(**send_kwargs)
+                    )
                 else:
                     raise
             log_debug(f"Text message sent OK, sent.message_id={sent.message_id}", 'telegram_pilgrim')
@@ -678,8 +711,14 @@ class TelegramPilgrim:
 
         except Exception as e:
             log_debug(f"_send_to_telegram EXCEPTION: {e}", 'telegram_pilgrim')
-            log_error(f"Error sending to Telegram: {e}")
-            traceback.print_exc()
+            if is_transient_error(e):
+                # A network blip, not a fault. Note this is NOT retried: unlike
+                # RetryAfter, a timeout may mean the send actually landed and we
+                # never saw the reply, so resending could duplicate.
+                log_transient(f"Error sending to Telegram: {e}", 'telegram_pilgrim')
+            else:
+                log_error(f"Error sending to Telegram: {e}")
+                traceback.print_exc()
 
     # ── media group ──────────────────────────────────
 
@@ -735,19 +774,23 @@ class TelegramPilgrim:
                     chunk_reply = reply_to if idx == 0 else None
                     chunk_topic = topic_id
                     try:
-                        result = await self.bot.send_media_group(
-                            chat_id=tg.channel_id_int,
-                            media=chunk,
-                            reply_to_message_id=chunk_reply,
-                            message_thread_id=chunk_topic
+                        result = await self._with_flood_retry(
+                            lambda: self.bot.send_media_group(
+                                chat_id=tg.channel_id_int,
+                                media=chunk,
+                                reply_to_message_id=chunk_reply,
+                                message_thread_id=chunk_topic
+                            )
                         )
                     except Exception as e_group:
                         if 'Message thread not found' in str(e_group):
                             log_warn(f"Topic {topic_id} not found (group); sending without thread", 'telegram_pilgrim')
-                            result = await self.bot.send_media_group(
-                                chat_id=tg.channel_id_int,
-                                media=chunk,
-                                reply_to_message_id=chunk_reply
+                            result = await self._with_flood_retry(
+                                lambda: self.bot.send_media_group(
+                                    chat_id=tg.channel_id_int,
+                                    media=chunk,
+                                    reply_to_message_id=chunk_reply
+                                )
                             )
                         else:
                             raise
@@ -770,45 +813,62 @@ class TelegramPilgrim:
                 with open(p, 'rb') as f:
                     try:
                         if is_extra_voice:
-                            extra = await self.bot.send_voice(
-                                chat_id=tg.channel_id_int, voice=f,
-                                caption=cap, parse_mode=pm,
-                                reply_to_message_id=rto, message_thread_id=tid
+                            extra = await self._with_flood_retry(
+                                lambda: self.bot.send_voice(
+                                    chat_id=tg.channel_id_int, voice=f,
+                                    caption=cap, parse_mode=pm,
+                                    reply_to_message_id=rto, message_thread_id=tid
+                                ),
+                                reset=lambda: f.seek(0),
                             )
                         elif is_extra_audio:
-                            extra = await self.bot.send_audio(
-                                chat_id=tg.channel_id_int, audio=f,
-                                caption=cap, parse_mode=pm,
-                                reply_to_message_id=rto, message_thread_id=tid
+                            extra = await self._with_flood_retry(
+                                lambda: self.bot.send_audio(
+                                    chat_id=tg.channel_id_int, audio=f,
+                                    caption=cap, parse_mode=pm,
+                                    reply_to_message_id=rto, message_thread_id=tid
+                                ),
+                                reset=lambda: f.seek(0),
                             )
                         else:
-                            extra = await self.bot.send_document(
-                                chat_id=tg.channel_id_int, document=f,
-                                caption=cap, parse_mode=pm,
-                                reply_to_message_id=rto, message_thread_id=tid
+                            extra = await self._with_flood_retry(
+                                lambda: self.bot.send_document(
+                                    chat_id=tg.channel_id_int, document=f,
+                                    caption=cap, parse_mode=pm,
+                                    reply_to_message_id=rto, message_thread_id=tid
+                                ),
+                                reset=lambda: f.seek(0),
                             )
                         if first_extra_sent_id is None:
                             first_extra_sent_id = extra.message_id
                     except Exception as e_extra:
                         if 'Message thread not found' in str(e_extra):
-                            f.seek(0)
                             if is_extra_voice:
-                                extra = await self.bot.send_voice(
-                                    chat_id=tg.channel_id_int, voice=f,
-                                    caption=cap, parse_mode=pm,
-                                    reply_to_message_id=rto
+                                extra = await self._with_flood_retry(
+                                    lambda: self.bot.send_voice(
+                                        chat_id=tg.channel_id_int, voice=f,
+                                        caption=cap, parse_mode=pm,
+                                        reply_to_message_id=rto
+                                    ),
+                                    reset=lambda: f.seek(0),
                                 )
                             elif is_extra_audio:
-                                extra = await self.bot.send_audio(
-                                    chat_id=tg.channel_id_int, audio=f,
-                                    caption=cap, parse_mode=pm,
-                                    reply_to_message_id=rto
+                                extra = await self._with_flood_retry(
+                                    lambda: self.bot.send_audio(
+                                        chat_id=tg.channel_id_int, audio=f,
+                                        caption=cap, parse_mode=pm,
+                                        reply_to_message_id=rto
+                                    ),
+                                    reset=lambda: f.seek(0),
                                 )
                             else:
-                                extra = await self.bot.send_document(
-                                    chat_id=tg.channel_id_int, document=f,
-                                    caption=cap, parse_mode=pm,
-                                    reply_to_message_id=rto
+                                extra = await self._with_flood_retry(
+                                    lambda: self.bot.send_document(
+                                        chat_id=tg.channel_id_int, document=f,
+                                        caption=cap, parse_mode=pm,
+                                        reply_to_message_id=rto
+                                    ),
+                                    reset=lambda: f.seek(0),
                                 )
                             if first_extra_sent_id is None:
                                 first_extra_sent_id = extra.message_id
@@ -879,21 +939,26 @@ class TelegramPilgrim:
 
         with open(file_path, 'rb') as f:
             try:
-                sent = await self._send_file(
-                    f, file_path, bridge_config, text, reply_to, topic_id,
-                    is_gif=is_gif, is_image=is_image, is_video=is_video,
-                    is_audio=is_audio, is_voice=is_voice, metadata=meta,
-                    has_spoiler=attachment.get('spoiler', False)
+                sent = await self._with_flood_retry(
+                    lambda: self._send_file(
+                        f, file_path, bridge_config, text, reply_to, topic_id,
+                        is_gif=is_gif, is_image=is_image, is_video=is_video,
+                        is_audio=is_audio, is_voice=is_voice, metadata=meta,
+                        has_spoiler=attachment.get('spoiler', False)
+                    ),
+                    reset=lambda: f.seek(0),
                 )
             except Exception as e_file:
                 if 'Message thread not found' in str(e_file):
                     log_warn(f"Topic {topic_id} not found; sending without thread", 'telegram_pilgrim')
-                    f.seek(0)
-                    sent = await self._send_file(
-                        f, file_path, bridge_config, text, reply_to, None,
-                        is_gif=is_gif, is_image=is_image, is_video=is_video,
-                        is_audio=is_audio, is_voice=is_voice, metadata=meta,
-                        has_spoiler=attachment.get('spoiler', False)
+                    sent = await self._with_flood_retry(
+                        lambda: self._send_file(
+                            f, file_path, bridge_config, text, reply_to, None,
+                            is_gif=is_gif, is_image=is_image, is_video=is_video,
+                            is_audio=is_audio, is_voice=is_voice, metadata=meta,
+                            has_spoiler=attachment.get('spoiler', False)
+                        ),
+                        reset=lambda: f.seek(0),
                     )
                 else:
                     raise

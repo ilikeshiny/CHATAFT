@@ -43,6 +43,52 @@ class DiscordPilgrim:
         self._last_bridged_author[bname] = author_key
         self._last_bridged_time[bname] = time.time()
 
+    # ── send retry ─────────────────────────────────────
+
+    # Backoff for transient Discord send failures (network blips, 5xx, 429).
+    # Total worst-case delay: ~26s before giving up.
+    _SEND_RETRY_DELAYS = (2, 6, 18)
+
+    def _is_transient_send_error(self, exc: Exception) -> bool:
+        """Return True if `exc` looks worth retrying (network / server-side)."""
+        if isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError)):
+            return True
+        # discord.HTTPException carries a `.status` attribute; retry on 5xx and 429.
+        http_exc = getattr(self._dlib, 'HTTPException', None)
+        if http_exc and isinstance(exc, http_exc):
+            status = getattr(exc, 'status', None)
+            if status is None:
+                return False
+            return status >= 500 or status == 429
+        return False
+
+    async def _send_with_retry(self, send_call, label: str = "send"):
+        """Run `send_call()` (async, no args) with backoff on transient errors.
+
+        Returns the send result on success. Raises the final exception if all
+        attempts fail, so the caller's existing except-clause fallback still
+        engages.
+        """
+        attempts = (0,) + self._SEND_RETRY_DELAYS
+        last_error = None
+        for i, delay in enumerate(attempts):
+            if delay:
+                log_warn(
+                    f"Retrying discord {label} in {delay}s "
+                    f"(attempt {i}/{len(attempts) - 1}, last error: {last_error})",
+                    self.component_name
+                )
+                await asyncio.sleep(delay)
+            try:
+                return await send_call()
+            except Exception as e:
+                if not self._is_transient_send_error(e):
+                    raise
+                last_error = e
+        # All retries exhausted on a transient error - re-raise the last one so
+        # the caller's outer except runs the legacy-mode fallback.
+        raise last_error if last_error else RuntimeError("send failed with no captured error")
+
     async def _schedule_file_cleanup(self, paths, delay=120):
         """Delay file deletion so other pilgrims can read the same files."""
         await asyncio.sleep(delay)
@@ -476,30 +522,42 @@ class DiscordPilgrim:
                     chunks = [discord_files[i:i + self.MAX_ATTACHMENTS]
                               for i in range(0, len(discord_files), self.MAX_ATTACHMENTS)]
                     for idx, chunk in enumerate(chunks):
+                        chunk_local = chunk
                         try:
                             if idx == 0:
                                 sent = await channel.send(
                                     content=content if (content and content.strip()) else None,
-                                    files=chunk,
+                                    files=chunk_local,
                                     reference=reference,
                                     mention_author=False
                                 )
                             else:
-                                await channel.send(files=chunk)
+                                await channel.send(files=chunk_local)
                         except Exception:
+                            # Retry the no-reference variant on transient errors
+                            # so a network blip doesn't drop the message.
                             if idx == 0:
-                                sent = await channel.send(
-                                    content=content if (content and content.strip()) else None,
-                                    files=chunk,
-                                    mention_author=False
+                                sent = await self._send_with_retry(
+                                    lambda: channel.send(
+                                        content=content if (content and content.strip()) else None,
+                                        files=chunk_local,
+                                        mention_author=False
+                                    ),
+                                    label="channel send with files"
                                 )
                             else:
-                                await channel.send(files=chunk)
+                                await self._send_with_retry(
+                                    lambda: channel.send(files=chunk_local),
+                                    label="channel send extra chunk"
+                                )
                 else:
                     try:
                         sent = await channel.send(content=content, reference=reference, mention_author=False)
                     except Exception:
-                        sent = await channel.send(content=content, mention_author=False)
+                        sent = await self._send_with_retry(
+                            lambda: channel.send(content=content, mention_author=False),
+                            label="channel send text-only"
+                        )
             finally:
                 paths = [att.get('local_path') for att in (bridge_msg.attachments or []) if att.get('local_path')]
                 if paths:
@@ -568,27 +626,37 @@ class DiscordPilgrim:
                     chunks = [files[i:i + self.MAX_ATTACHMENTS]
                               for i in range(0, len(files), self.MAX_ATTACHMENTS)]
                     for idx, chunk in enumerate(chunks):
+                        chunk_local = chunk
                         if idx == 0:
-                            sent = await webhook.send(
-                                content=content if (content and content.strip()) else None,
-                                username=base_username,
-                                avatar_url=safe_avatar,
-                                files=chunk,
-                                wait=True
+                            sent = await self._send_with_retry(
+                                lambda: webhook.send(
+                                    content=content if (content and content.strip()) else None,
+                                    username=base_username,
+                                    avatar_url=safe_avatar,
+                                    files=chunk_local,
+                                    wait=True
+                                ),
+                                label="webhook send with files"
                             )
                         else:
-                            await webhook.send(
-                                username=base_username,
-                                avatar_url=safe_avatar,
-                                files=chunk,
-                                wait=True
+                            await self._send_with_retry(
+                                lambda: webhook.send(
+                                    username=base_username,
+                                    avatar_url=safe_avatar,
+                                    files=chunk_local,
+                                    wait=True
+                                ),
+                                label="webhook send extra chunk"
                             )
                 else:
-                    sent = await webhook.send(
-                        content=content,
-                        username=base_username,
-                        avatar_url=safe_avatar,
-                        wait=True
+                    sent = await self._send_with_retry(
+                        lambda: webhook.send(
+                            content=content,
+                            username=base_username,
+                            avatar_url=safe_avatar,
+                            wait=True
+                        ),
+                        label="webhook send text-only"
                     )
 
             paths = [att.get('local_path') for att in (bridge_msg.attachments or []) if att.get('local_path')]

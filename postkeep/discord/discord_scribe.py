@@ -14,7 +14,9 @@ from postkeep.papyrus import (
     log_info, log_error, log_warn, log_success, log_debug,
     BridgeMessage,
     extract_media_urls, extract_tenor_urls, escape_discord_emojis,
-    convert_video_to_gif, get_file_type_from_url, normalize_mime_type,
+    is_player_page_url, is_domain_downloadable,
+    convert_video_to_gif, get_file_type_from_url,
+    attachment_name_from_download, normalize_mime_type,
     should_skip_download, extract_ignore_hint_urls,
     is_user_ignored, add_ignored_user, is_user_admin,
     add_downloadable_domain, add_ignored_domain,
@@ -45,8 +47,7 @@ class DiscordScribe:
 
         # Cache: is privacy reachable on any bridge? When False we skip the
         # -privacy command dispatch AND every per-message privacy check.
-        # Refreshed by core.reload_config when implemented; safe default is to
-        # recompute on demand if bridges change at runtime.
+        # Refreshed by core.reload_config().
         bridges = getattr(core, 'bridges', None)
         self._privacy_active = is_privacy_active(bridges) if bridges else False
 
@@ -417,8 +418,11 @@ class DiscordScribe:
             if not is_user_admin('discord', message.author.id):
                 await message.channel.send('Not authorized to reload', reference=message)
                 return
-            self.core.reload_config()
-            await message.channel.send('Discord config reloaded', reference=message)
+            restart_needed = self.core.reload_config()
+            reply = 'Discord config reloaded'
+            if restart_needed:
+                reply += ('\nRestart required for: ' + ', '.join(restart_needed))
+            await message.channel.send(reply, reference=message)
         except Exception as e:
             await message.channel.send(f"Reload failed: {e}")
 
@@ -710,6 +714,23 @@ class DiscordScribe:
                     if etype in ('rich', 'article', 'link'):
                         log_debug('Skipping embed download due to type rich/article/link')
                         continue
+                    # oEmbed providers (YouTube, Vimeo, Twitch...) give a
+                    # type of 'video' whose video.url is an iframe player page,
+                    # not a file. Downloading it yields an HTML document saved
+                    # as .mp4, which lands on the far side as a broken 0kb
+                    # attachment. Leave the link alone and let the target
+                    # platform render its own preview. We check the page URL
+                    # too, so we don't fall through to bridging a bare
+                    # thumbnail in place of the video.
+                    # An explicit download_domains.txt entry overrides this,
+                    # same as it overrides the ignore list. Worst case there is
+                    # a wasted request: download_media still refuses to save an
+                    # HTML response as an attachment.
+                    player_url = chosen_url if is_player_page_url(chosen_url) else (
+                        direct_url if is_player_page_url(direct_url) else None)
+                    if player_url and not is_domain_downloadable(urlparse(str(player_url)).netloc.lower()):
+                        log_debug(f"Skipping embed download, player page not media: {chosen_url}")
+                        continue
                     candidate_for_policy = chosen_url or direct_url or video_url or image_url or thumb_url
                     check_url = self._unwrap_external_url(candidate_for_policy) if candidate_for_policy else candidate_for_policy
                     try:
@@ -959,6 +980,17 @@ class DiscordScribe:
                 age = (now - created).total_seconds()
                 if age < 0.6:
                     await asyncio.sleep(0.7 - age if age < 0.7 else 0)
+        except Exception:
+            pass
+
+        # Rewrite links up front, before anything reads message.content, so the
+        # media scan below sees the replacement hosts (d.fixupx.com and
+        # friends) rather than the originals it can't download from. The pass
+        # is idempotent, so the later call on the assembled content - which
+        # also covers forward and reply-preview text - stays a no-op here.
+        try:
+            if message.content:
+                message.content = apply_link_replacements(message.content)
         except Exception:
             pass
 
@@ -1300,7 +1332,7 @@ class DiscordScribe:
             if is_discord_cdn_text:
                 file_path = await self.core.download_with_recovery(url, None, message=message)
                 if file_path:
-                    filename = os.path.basename(url.split('?')[0]) or f"media_{int(time.time())}"
+                    filename = attachment_name_from_download(url, file_path)
                     file_type = get_file_type_from_url(url, filename)
                     attachments.append({'url': url, 'filename': filename, 'type': file_type, 'local_path': file_path})
                     seen_urls.add(url)
@@ -1314,7 +1346,7 @@ class DiscordScribe:
 
             file_path = await self.core.download_media(url)
             if file_path:
-                filename = os.path.basename(url.split('?')[0]) or f"media_{int(time.time())}"
+                filename = attachment_name_from_download(url, file_path)
                 file_type = get_file_type_from_url(url, filename)
                 attachments.append({'url': url, 'filename': filename, 'type': file_type, 'local_path': file_path})
                 seen_urls.add(url)
@@ -1323,7 +1355,7 @@ class DiscordScribe:
                 await asyncio.sleep(0.6)
                 file_path = await self.core.download_media(url)
                 if file_path:
-                    filename = os.path.basename(url.split('?')[0]) or f"media_{int(time.time())}"
+                    filename = attachment_name_from_download(url, file_path)
                     file_type = get_file_type_from_url(url, filename)
                     attachments.append({'url': url, 'filename': filename, 'type': file_type, 'local_path': file_path})
                     seen_urls.add(url)
@@ -1786,13 +1818,22 @@ class DiscordScribe:
                         else:
                             end_bound_id = end_msg_id
 
+                    # An explicit import is a one-shot backfill. Without this
+                    # check it re-runs on every on_ready - which fires on each
+                    # Discord re-IDENTIFY, not just process restarts - and
+                    # replays the whole range again.
+                    if db.import_already_completed('discord', start_link, end_link):
+                        log_info(
+                            f"[IMPORT] Bridge '{bridge_name}': explicit import already completed "
+                            f"for this range; skipping. Change import_start to run a new one.",
+                            self.component_name,
+                        )
+                        continue
+
                     try:
                         import uuid as _uuid
+                        removed = db.clear_import_range('discord', start_msg_id, end_bound_id)
                         with db.conn:
-                            db.conn.execute(
-                                "DELETE FROM message_map WHERE platform = 'discord' AND "
-                                "(direction = 'dc2tg' OR direction IS NULL OR TRIM(direction) = '')"
-                            )
                             db.conn.execute(
                                 "INSERT OR REPLACE INTO message_map "
                                 "(platform, platform_id, group_id, direction, timestamp) "
@@ -1800,11 +1841,23 @@ class DiscordScribe:
                                 ('discord', str(start_msg_id - 1), str(_uuid.uuid4()), 'dc2tg', time.time())
                             )
                         last_processed = start_msg_id - 1
+                        log_info(
+                            f"[IMPORT] Bridge '{bridge_name}': cleared {removed} mapping row(s) "
+                            f"inside the import range.",
+                            self.component_name,
+                        )
                     except Exception as seed_exc:
                         log_error(f"[IMPORT] Bridge '{bridge_name}': failed to seed: {seed_exc}", self.component_name)
                         continue
                 else:
-                    raw_last = db.get_last_platform_id('discord', direction='dc2tg')
+                    # Highest discord ID that actually reached another platform.
+                    # The old direction='dc2tg' filter only saw rows whose
+                    # direction the telegram pilgrim happened to stamp first;
+                    # with a second target present it skipped rows and rewound
+                    # the watermark into history that was already forwarded.
+                    raw_last = db.get_last_bridged_id('discord')
+                    if raw_last is None:
+                        raw_last = db.get_last_platform_id('discord', direction='dc2tg')
                     if raw_last is None:
                         raw_last = db.get_last_platform_id('discord')
                     try:
@@ -1868,6 +1921,7 @@ class DiscordScribe:
                 # have no cap (user intentionally wants full history).
                 _CATCHUP_LIMIT = 5000
                 processed = 0
+                completed_cleanly = False
                 try:
                     async for msg in channel.history(**history_params):
                         if end_bound_id and msg.id > end_bound_id:
@@ -1880,26 +1934,57 @@ class DiscordScribe:
                                 self.component_name,
                             )
                             break
-                        if ds.ignore_bots and msg.author.bot:
+                        # on_message never bridges bot messages regardless of
+                        # config, so the catch-up must not either - otherwise it
+                        # forwards messages the live path skipped, which then
+                        # have no mapping and repeat on every subsequent run.
+                        if msg.author.bot:
                             continue
                         if ds.ignore_webhooks and msg.webhook_id:
                             continue
+                        # Fail closed: if the dedup lookup breaks we skip rather
+                        # than re-send. A silent failure here re-floods the whole
+                        # range, so it is loud.
                         try:
                             if db.get_all_mappings('discord', str(msg.id)):
                                 continue
-                        except Exception:
-                            pass
+                        except Exception as dedup_exc:
+                            log_error(
+                                f"[IMPORT] Bridge '{bridge_name}': dedup lookup failed for "
+                                f"{msg.id} ({dedup_exc}); skipping to avoid a duplicate.",
+                                self.component_name,
+                            )
+                            continue
                         async with import_lock:
                             await self.process_discord_message(msg)
                         processed += 1
                         if processed % 25 == 0:
                             log_info(f"[IMPORT] Bridge '{bridge_name}': processed {processed} messages so far.", self.component_name)
                         await asyncio.sleep(0.2)
+                    completed_cleanly = True
                 except Exception as history_exc:
+                    completed_cleanly = False
                     log_error(f"[IMPORT] Bridge '{bridge_name}': history retrieval failed: {history_exc}", self.component_name)
 
                 if processed:
                     log_success(f"[IMPORT] Bridge '{bridge_name}': finished. {processed} messages forwarded.", self.component_name)
+
+                # Retire the one-shot backfill only if it actually reached the
+                # end of the range; a crashed run stays armed so it can resume.
+                if explicit_import and completed_cleanly:
+                    try:
+                        db.mark_import_complete('discord', start_link, end_link)
+                        log_success(
+                            f"[IMPORT] Bridge '{bridge_name}': explicit import marked complete. "
+                            f"It will not run again unless import_start changes.",
+                            self.component_name,
+                        )
+                    except Exception as mark_exc:
+                        log_error(
+                            f"[IMPORT] Bridge '{bridge_name}': could not record import completion "
+                            f"({mark_exc}); it may re-run on the next reconnect.",
+                            self.component_name,
+                        )
 
         except asyncio.CancelledError:
             raise

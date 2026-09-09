@@ -23,7 +23,7 @@ from postkeep.papyrus import (
     format_privacy_levels_phrase,
     compute_incognito_name, ensure_incognito_avatar,
     apply_link_replacements, is_privacy_active,
-    normalize_mime_type,
+    normalize_mime_type, ensure_filename_extension,
 )
 
 if TYPE_CHECKING:
@@ -77,6 +77,96 @@ class TelegramScribe:
         self._rabbitmq_connection = None
         self._rabbitmq_channel = None
         self._connect_rabbitmq()
+
+    # ── attachment download helpers ─────────────────
+
+    # Retry cadence for failed telegram downloads under load / transient TG API
+    # errors. Total wall time before giving up: ~81s. Message publish is delayed
+    # while retries run, which may reorder against later messages from the same
+    # chat - acceptable trade-off for occasional failures.
+    _DOWNLOAD_RETRY_DELAYS = (1, 4, 16, 60)
+
+    async def _do_download(self, media, chat_id, message_id,
+                           is_animation: bool, is_voice: bool,
+                           is_static_sticker: bool) -> dict:
+        """Perform a single download attempt. Returns an attachment dict on
+        success; raises on failure so the caller can decide to retry."""
+        async with self._download_semaphore:
+            file = await media.get_file()
+            cache_dir = ensure_cache_dir()
+
+            original_name = getattr(media, 'file_name', None)
+            if original_name:
+                filename = original_name
+            elif file.file_path:
+                filename = os.path.basename(file.file_path)
+            else:
+                filename = f"tg_media_{media.file_unique_id}"
+
+            if is_animation and not filename.lower().endswith('.mp4'):
+                base, _ = os.path.splitext(filename)
+                filename = base + ".mp4"
+            if is_voice and not filename.lower().endswith(('.ogg', '.oga', '.opus')):
+                base, _ = os.path.splitext(filename)
+                filename = base + ".ogg"
+            if is_static_sticker and not filename.lower().endswith('.webp'):
+                base, _ = os.path.splitext(filename)
+                filename = base + ".webp"
+
+            raw_mime = getattr(media, 'mime_type', None)
+            if is_static_sticker:
+                att_mime = 'image/webp'
+            else:
+                att_mime = normalize_mime_type(raw_mime, filename=filename)
+
+            # If Telegram's internal path gave us an extension-less name
+            # (e.g. `documents/file_24390`), restore it from the MIME so
+            # downstream platforms render inline previews.
+            filename = ensure_filename_extension(filename, att_mime)
+
+            local_path = os.path.join(cache_dir, f"tgb_{chat_id}_{message_id}_{filename}")
+            await file.download_to_drive(local_path)
+
+        if not os.path.exists(local_path):
+            raise RuntimeError(f"download_to_drive completed but file missing: {local_path}")
+
+        return {
+            'url': '', 'filename': filename,
+            'type': att_mime,
+            'local_path': local_path,
+        }
+
+    async def _download_with_retry(self, media, chat_id, message_id, *,
+                                    is_animation: bool = False, is_voice: bool = False,
+                                    is_static_sticker: bool = False,
+                                    context_label: str = "attachment") -> Optional[dict]:
+        """Download with exponential backoff. Returns attachment dict on
+        success, or None if all attempts failed."""
+        last_error = None
+        attempts = (0,) + self._DOWNLOAD_RETRY_DELAYS  # first attempt immediate
+        for i, delay in enumerate(attempts):
+            if delay:
+                log_warn(
+                    f"(telegram_scribe) {context_label} download retry {i}/{len(attempts) - 1} "
+                    f"after {delay}s (chat={chat_id} msg={message_id}, last error: {last_error})",
+                    'telegram_scribe'
+                )
+                await asyncio.sleep(delay)
+            try:
+                return await self._do_download(
+                    media, chat_id, message_id,
+                    is_animation=is_animation,
+                    is_voice=is_voice,
+                    is_static_sticker=is_static_sticker,
+                )
+            except Exception as e:
+                last_error = e
+        log_error(
+            f"(telegram_scribe) {context_label} download failed after "
+            f"{len(attempts)} attempts (chat={chat_id} msg={message_id}): {last_error}",
+            'telegram_scribe'
+        )
+        return None
 
     def _connect_rabbitmq(self):
         try:
@@ -876,53 +966,16 @@ class TelegramScribe:
             elif message.document:
                 actual_media = message.document
 
-            if actual_media:
-                try:
-                    if hasattr(actual_media, 'get_file'):
-                        # Throttle concurrent downloads to avoid TG API rate-limiting
-                        async with self._download_semaphore:
-                            file = await actual_media.get_file()
-                            cache_dir = ensure_cache_dir()
-
-                            # Prefer original filename for audio (preserves song title)
-                            original_name = getattr(actual_media, 'file_name', None)
-                            if original_name:
-                                filename = original_name
-                            elif file.file_path:
-                                filename = os.path.basename(file.file_path)
-                            else:
-                                filename = f"tg_media_{actual_media.file_unique_id}"
-
-                            if is_animation and not filename.lower().endswith('.mp4'):
-                                base, _ = os.path.splitext(filename)
-                                filename = base + ".mp4"
-
-                            # Ensure voice messages have .ogg extension
-                            if is_voice and not filename.lower().endswith(('.ogg', '.oga', '.opus')):
-                                base, _ = os.path.splitext(filename)
-                                filename = base + ".ogg"
-
-                            # Ensure static stickers have .webp extension
-                            if is_static_sticker and not filename.lower().endswith('.webp'):
-                                base, _ = os.path.splitext(filename)
-                                filename = base + ".webp"
-
-                            local_path = os.path.join(cache_dir, f"tgb_{message.chat_id}_{message.message_id}_{filename}")
-                            await file.download_to_drive(local_path)
-
-                        if os.path.exists(local_path):
-                            raw_mime = getattr(actual_media, 'mime_type', None)
-                            if is_static_sticker:
-                                att_mime = 'image/webp'
-                            else:
-                                att_mime = normalize_mime_type(raw_mime, filename=filename)
-                            attachments.append({
-                                'url': '', 'filename': filename,
-                                'type': att_mime,
-                                'local_path': local_path
-                            })
-                except Exception as e:
-                    log_error(f"(telegram_scribe) attachment download failed: {e}")
+            if actual_media and hasattr(actual_media, 'get_file'):
+                att = await self._download_with_retry(
+                    actual_media, message.chat_id, message.message_id,
+                    is_animation=is_animation,
+                    is_voice=is_voice,
+                    is_static_sticker=is_static_sticker,
+                    context_label="primary attachment",
+                )
+                if att:
+                    attachments.append(att)
 
             if extra_media_messages:
                 for extra_msg in extra_media_messages:
@@ -949,33 +1002,15 @@ class TelegramScribe:
                         extra_media = extra_msg.document
 
                     if extra_media and hasattr(extra_media, 'get_file'):
-                        try:
-                            async with self._download_semaphore:
-                                efile = await extra_media.get_file()
-                                cache_dir = ensure_cache_dir()
-                                extra_original = getattr(extra_media, 'file_name', None)
-                                if extra_original:
-                                    efname = extra_original
-                                elif efile.file_path:
-                                    efname = os.path.basename(efile.file_path)
-                                else:
-                                    efname = f"tg_media_{extra_media.file_unique_id}"
-                                if extra_is_anim and not efname.lower().endswith('.mp4'):
-                                    base, _ = os.path.splitext(efname)
-                                    efname = base + ".mp4"
-                                elocal = os.path.join(cache_dir, f"tgb_{extra_msg.chat_id}_{extra_msg.message_id}_{efname}")
-                                await efile.download_to_drive(elocal)
-                            if os.path.exists(elocal):
-                                extra_raw_mime = getattr(extra_media, 'mime_type', None)
-                                attachments.append({
-                                    'url': '', 'filename': efname,
-                                    'type': normalize_mime_type(extra_raw_mime, filename=efname),
-                                    'local_path': elocal
-                                })
-                                if extra_is_anim:
-                                    is_animation = True
-                        except Exception as e:
-                            log_error(f"(telegram_scribe) media group extra download failed: {e}")
+                        extra_att = await self._download_with_retry(
+                            extra_media, extra_msg.chat_id, extra_msg.message_id,
+                            is_animation=extra_is_anim,
+                            context_label="media-group attachment",
+                        )
+                        if extra_att:
+                            attachments.append(extra_att)
+                            if extra_is_anim:
+                                is_animation = True
 
                     extra_caption = extra_msg.text or extra_msg.caption or ''
                     if extra_caption:

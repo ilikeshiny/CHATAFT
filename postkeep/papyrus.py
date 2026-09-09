@@ -129,7 +129,16 @@ def _get_file_logger():
         from logging.handlers import RotatingFileHandler
         logs_dir = os.path.join(CITADEL_ROOT, '_logs')
         os.makedirs(logs_dir, exist_ok=True)
-        log_path = os.path.join(logs_dir, 'bridge.log')
+        # One file per component. Every process previously shared bridge.log
+        # with its own RotatingFileHandler, so rotations raced and silently
+        # dropped each other's lines.
+        component = os.environ.get('BRIDGE_COMPONENT') or ''
+        if not component:
+            try:
+                component = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+            except Exception:
+                component = ''
+        log_path = os.path.join(logs_dir, f"{component or 'bridge'}.log")
         handler = RotatingFileHandler(
             log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding='utf-8',
         )
@@ -237,12 +246,132 @@ def log_success(msg, component=None):
         sys.stdout.flush()
 
 
+# ── transient network errors ─────────────────────────
+#
+# A 2-second API hiccup is not an incident, but it used to emit a full ERROR
+# plus traceback per message. These helpers classify such failures and collapse
+# repeats so a blip costs one line and a real outage still shows up.
+
+QUIET_TRANSIENT_ERRORS = True
+TRANSIENT_SUMMARY_WINDOW = 60.0
+
+_TRANSIENT_PATTERNS = (
+    'timed out', 'timeout', 'connection reset', 'connection aborted',
+    'connection refused', 'connection closed', 'connection lost',
+    'connection_forced', 'connection error', 'cannot connect to host',
+    'server disconnected', 'serverdisconnectederror', 'remote end closed',
+    'broken pipe', 'network is unreachable', 'temporary failure in name',
+    'temporarily unavailable', 'getaddrinfo', 'name or service not known',
+    'eof occurred in violation of protocol', 'bad gateway',
+    'service unavailable', 'gateway time-out', 'read error',
+    'clientconnectorerror', 'incompleteread', 'stream connection lost',
+)
+
+# Deliberately NOT treated as transient: certificate/SSL verification failures,
+# auth errors (401/403), and 404s. Those are real and must stay loud.
+_transient_state = {}
+
+
+def is_transient_error(err) -> bool:
+    """True if `err` looks like a passing network hiccup rather than a fault."""
+    s = str(err).lower()
+    return any(p in s for p in _TRANSIENT_PATTERNS)
+
+
+def _transient_key(msg: str) -> str:
+    s = re.sub(r'https?://\S+', '<URL>', str(msg))
+    return re.sub(r'\d+', 'N', s)[:120]
+
+
+def log_transient(msg, component=None):
+    """Log a network blip, collapsing identical repeats inside a time window.
+
+    The first occurrence is emitted immediately as a WARNING; further copies
+    are counted, and the tally is attached to the next line emitted after the
+    window closes. A burst that stops entirely holds its tally until the same
+    error recurs - acceptable, since the first line already recorded it.
+    """
+    if not QUIET_TRANSIENT_ERRORS:
+        log_error(msg, component)
+        return
+
+    key = _transient_key(msg)
+    now = time.time()
+    state = _transient_state.get(key)
+
+    if state is not None and (now - state['start']) < TRANSIENT_SUMMARY_WINDOW:
+        state['count'] += 1
+        _log_to_file('debug', f"(suppressed) {msg}")
+        return
+
+    suffix = ''
+    if state is not None and state['count'] > 1:
+        suffix = (f"  (+{state['count'] - 1} more like this in the previous "
+                  f"{int(TRANSIENT_SUMMARY_WINDOW)}s)")
+    _transient_state[key] = {'start': now, 'count': 1}
+
+    # Keep the table from growing without bound on long uptimes.
+    if len(_transient_state) > 256:
+        cutoff = now - (TRANSIENT_SUMMARY_WINDOW * 10)
+        for k in [k for k, v in _transient_state.items() if v['start'] < cutoff]:
+            _transient_state.pop(k, None)
+
+    log_warn(f"{msg}{suffix}", component)
+
+
+def log_error_smart(msg, component=None):
+    """Route to log_transient for network blips, log_error for everything else."""
+    if QUIET_TRANSIENT_ERRORS and is_transient_error(msg):
+        log_transient(msg, component)
+    else:
+        log_error(msg, component)
+
+
 
 # ── media patterns ───────────────────────────────────
 
 MEDIA_URL_PATTERNS = [
     r"https?://[^\s]+?\.(?:jpg|jpeg|png|gif|webp|mp4|webm|mov|avi|mkv)(?:\?[^\s]*)?"
 ]
+
+# Hosts that serve the raw media file at any path, with no file extension in the
+# URL - the "direct" variants of the social-media embed fixers that
+# link_replacements.txt rewrites links into. `https://d.fixupx.com/u/status/1`
+# redirects straight to the .mp4, so these are downloadable even though the
+# extension-based pattern above can't see them.
+#
+# Being generous here is cheap: a host that turns out to serve HTML gets
+# rejected by download_media's content-type check and the link is left as text,
+# which is exactly the behaviour we'd have had anyway.
+DIRECT_MEDIA_HOSTS = (
+    'd.fixupx.com', 'i.fixupx.com',
+    'd.fxtwitter.com', 'i.fxtwitter.com',
+    'd.vxtwitter.com', 'i.vxtwitter.com',
+    'd.fixvx.com', 'i.fixvx.com',
+    'd.kkinstagram.com', 'd.ddinstagram.com',
+    'd.tnktok.com', 'd.tiktxk.com',
+    'd.rxddit.com', 'd.vxreddit.com',
+)
+
+DIRECT_MEDIA_URL_PATTERN = (
+    r"https?://(?:" + "|".join(h.replace('.', r'\.') for h in DIRECT_MEDIA_HOSTS) +
+    r")/[^\s<>\"'\)\]]+"
+)
+
+# Player pages: an embeddable HTML page for a video, not the video itself.
+# Discord fills embed.video.url with one of these for any oEmbed provider
+# (YouTube, Vimeo, Twitch...), so a naive "type == video, download video.url"
+# fetches an HTML document and hands the target platform a broken file.
+PLAYER_PAGE_HOSTS = (
+    'youtube.com', 'youtu.be', 'youtube-nocookie.com',
+    'vimeo.com', 'player.vimeo.com',
+    'twitch.tv', 'clips.twitch.tv',
+    'dailymotion.com', 'nicovideo.jp', 'bilibili.com',
+    'soundcloud.com', 'spotify.com', 'open.spotify.com',
+    'kick.com', 'rumble.com', 'odysee.com',
+    'twitcasting.tv', 'mixcloud.com', 'bandcamp.com',
+)
+
 TENOR_URL_PATTERN = r'https://tenor\.com/view/[^\s]+'
 DISCORD_CUSTOM_EMOJI_PATTERN = r'<(a?):(\w+):(\d+)>'
 
@@ -572,9 +701,12 @@ def load_global_settings(config_file=None, component=None):
         'QUEUE_NAMESPACE': '',
         'PRIVACY_LIMIT': 1,
         'INCOGNITO_AVATAR_BG': 'transparent',
-        'DISCORD_SKIP_DOWNLOAD_DOMAINS': [
-            'x.com', 'twitter.com', 'fixupx.com', 'vxtwitter.com', 'fxtwitter.com',
-        ],
+        # Cleanup defaults (overridable via [Cleanup] in codex.ini)
+        'CLEANUP_ENABLED': True,
+        'CLEANUP_HOUR': 4,
+        'MIN_MAPPINGS_PER_BRIDGE': 10000,
+        'MAX_MAPPING_AGE_DAYS': 60,
+        'AVATAR_RETENTION_DAYS': 90,
     }
 
     if 'Credentials' in config:
@@ -606,14 +738,6 @@ def load_global_settings(config_file=None, component=None):
         global_settings['CACHE_MAX_SIZE_MB'] = int(
             features.get('CACHE_MAX_SIZE_MB', str(global_settings['CACHE_MAX_SIZE_MB']))
         )
-        if 'DISCORD_SKIP_DOWNLOAD_DOMAINS' in features:
-            try:
-                domains = [d.strip() for d in features.get('DISCORD_SKIP_DOWNLOAD_DOMAINS', '').split(',') if d.strip()]
-                if domains:
-                    global_settings['DISCORD_SKIP_DOWNLOAD_DOMAINS'] = domains
-            except Exception:
-                pass
-
         global_settings['RABBITMQ_HOST'] = features.get('RABBITMQ_HOST', 'localhost')
         global_settings['RABBITMQ_PORT'] = int(features.get('RABBITMQ_PORT', '5672'))
         global_settings['RABBITMQ_USER'] = features.get('RABBITMQ_USER', 'guest')
@@ -632,6 +756,21 @@ def load_global_settings(config_file=None, component=None):
                 features.get('INCOGNITO_AVATAR_BG', 'transparent') or 'transparent'
             ).strip()
 
+        if 'QUIET_TRANSIENT_ERRORS' in features:
+            global QUIET_TRANSIENT_ERRORS
+            QUIET_TRANSIENT_ERRORS = str(
+                features.get('QUIET_TRANSIENT_ERRORS', 'true')
+            ).strip().lower() not in ('false', 'no', 'off', '0')
+
+        if 'TRANSIENT_SUMMARY_WINDOW' in features:
+            global TRANSIENT_SUMMARY_WINDOW
+            try:
+                TRANSIENT_SUMMARY_WINDOW = max(
+                    1.0, float(features.get('TRANSIENT_SUMMARY_WINDOW', '60'))
+                )
+            except Exception:
+                pass
+
         log_level = features.get('LOG_LEVEL', 'INFO')
         set_log_level(log_level)
 
@@ -643,6 +782,24 @@ def load_global_settings(config_file=None, component=None):
 
         if 'STOATCHAT_AVATAR_UPLOAD_CHANNEL_ID' in features:
             global_settings['STOATCHAT_AVATAR_UPLOAD_CHANNEL_ID'] = features.get('STOATCHAT_AVATAR_UPLOAD_CHANNEL_ID')
+
+    if 'Cleanup' in config:
+        cleanup = config['Cleanup']
+        try:
+            global_settings['CLEANUP_ENABLED'] = cleanup.getboolean('enabled', True)
+        except Exception:
+            pass
+        for key, default in (
+            ('cleanup_hour', 4),
+            ('min_mappings_per_bridge', 10000),
+            ('max_mapping_age_days', 60),
+            ('avatar_retention_days', 90),
+        ):
+            try:
+                val = int(cleanup.get(key, str(default)))
+                global_settings[key.upper()] = max(0, val)
+            except Exception:
+                pass
 
     if 'Global' in config:
         for key, value in config['Global'].items():
@@ -687,6 +844,14 @@ class BridgeDatabase:
             timestamp INTEGER
         )''')
 
+        c.execute('''CREATE TABLE IF NOT EXISTS import_state (
+            platform     TEXT NOT NULL,
+            import_start TEXT NOT NULL,
+            import_end   TEXT,
+            completed_at REAL,
+            PRIMARY KEY (platform)
+        )''')
+
         self.conn.commit()
 
         # ── generic mapping api ─────────────────────────────
@@ -697,30 +862,60 @@ class BridgeDatabase:
         src_id = str(source_id)
         tgt_id = str(target_id)
 
-        row = self.conn.execute(
-            "SELECT group_id FROM message_map WHERE platform = ? AND platform_id = ?",
-            (source_platform, src_id),
-        ).fetchone()
-
-        if not row:
-            row = self.conn.execute(
+        # BEGIN IMMEDIATE takes the write lock before the lookup. Two pilgrims
+        # fanning the same source message out to different targets would
+        # otherwise both read "no group yet" and mint competing group_ids; the
+        # loser's INSERT OR IGNORE was then silently dropped, stranding its
+        # target row in a group of one - unreachable for edits/deletes and
+        # never reaped by cleanup.
+        if self.conn.in_transaction:
+            self.conn.commit()
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            src_row = self.conn.execute(
+                "SELECT group_id FROM message_map WHERE platform = ? AND platform_id = ?",
+                (source_platform, src_id),
+            ).fetchone()
+            tgt_row = self.conn.execute(
                 "SELECT group_id FROM message_map WHERE platform = ? AND platform_id = ?",
                 (target_platform, tgt_id),
             ).fetchone()
 
-        gid = row[0] if row else str(uuid.uuid4())
+            if src_row and tgt_row and src_row[0] != tgt_row[0]:
+                # Both halves already exist but in separate groups - either a
+                # race that predates this fix or leftover split data. Fold the
+                # target's whole group into the source's so every sibling row
+                # moves with it rather than half the group being orphaned.
+                gid = src_row[0]
+                self.conn.execute(
+                    "UPDATE message_map SET group_id = ? WHERE group_id = ?",
+                    (gid, tgt_row[0]),
+                )
+            elif src_row:
+                gid = src_row[0]
+            elif tgt_row:
+                gid = tgt_row[0]
+            else:
+                gid = str(uuid.uuid4())
 
-        with self.conn:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO message_map "
-                "(platform, platform_id, group_id, direction, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (source_platform, src_id, gid, direction, now),
-            )
-            self.conn.execute(
-                "INSERT OR IGNORE INTO message_map "
-                "(platform, platform_id, group_id, direction, timestamp) VALUES (?, ?, ?, ?, ?)",
-                (target_platform, tgt_id, gid, direction, now),
-            )
+            # Upsert rather than INSERT OR IGNORE: an existing row must still be
+            # pulled into the winning group, and a row written earlier without a
+            # direction gets one. An existing non-empty direction is left alone
+            # so a second target can't relabel the first one's row.
+            for platform, pid in ((source_platform, src_id), (target_platform, tgt_id)):
+                self.conn.execute(
+                    "INSERT INTO message_map "
+                    "(platform, platform_id, group_id, direction, timestamp) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(platform, platform_id) DO UPDATE SET "
+                    "  group_id = excluded.group_id, "
+                    "  direction = COALESCE(NULLIF(message_map.direction, ''), excluded.direction)",
+                    (platform, pid, gid, direction, now),
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def get_mapped_id(self, from_platform: str, from_id: str,
                       to_platform: str) -> Optional[str]:
@@ -758,6 +953,81 @@ class BridgeDatabase:
             (platform,),
         ).fetchone()
         return row[0] if row else None
+
+    def get_last_bridged_id(self, platform: str) -> Optional[str]:
+        """Highest `platform` message ID that has a counterpart elsewhere.
+
+        Deliberately ignores `direction`: with more than one target the source
+        row carries whichever direction its first pilgrim wrote, so filtering
+        on it hides real rows and drags the catch-up watermark backwards into
+        already-bridged history. Uses the same "exists on another platform"
+        predicate as get_all_mappings, so the watermark and the dedup check
+        can never disagree.
+
+        Orders by numeric ID, not insertion time - a backfill writes old
+        messages with a fresh timestamp, which makes timestamp ordering point
+        at the wrong high-water mark. Only valid for snowflake-style numeric
+        IDs (discord, telegram).
+        """
+        row = self.conn.execute(
+            "SELECT m1.platform_id FROM message_map m1 "
+            "INNER JOIN message_map m2 ON m1.group_id = m2.group_id "
+            "WHERE m1.platform = ? AND m2.platform != ? "
+            "AND m1.platform_id GLOB '[0-9]*' "
+            "ORDER BY CAST(m1.platform_id AS INTEGER) DESC LIMIT 1",
+            (platform, platform),
+        ).fetchone()
+        return row[0] if row else None
+
+    # ── explicit import bookkeeping ─────────────────────
+
+    def import_already_completed(self, platform: str, import_start: str,
+                                 import_end: str) -> bool:
+        """True if this exact start/end pair already ran to completion.
+
+        Keyed on the config values themselves so editing import_start to a new
+        link re-arms the import without any manual DB surgery.
+        """
+        row = self.conn.execute(
+            "SELECT import_start, import_end FROM import_state "
+            "WHERE platform = ? AND completed_at IS NOT NULL",
+            (platform,),
+        ).fetchone()
+        if not row:
+            return False
+        return row[0] == (import_start or '') and (row[1] or '') == (import_end or '')
+
+    def mark_import_complete(self, platform: str, import_start: str,
+                             import_end: str):
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO import_state "
+                "(platform, import_start, import_end, completed_at) VALUES (?, ?, ?, ?)",
+                (platform, import_start or '', import_end or '', time.time()),
+            )
+
+    def clear_import_range(self, platform: str, start_id: int,
+                           end_id: Optional[int] = None) -> int:
+        """Drop mappings for `platform` messages inside an explicit import range.
+
+        Deletes whole groups (not just the source row) so re-imported messages
+        remap cleanly to their new target IDs and no orphan rows are left
+        behind. Scoped to the range so history outside the backfill keeps its
+        reply/edit/delete mappings.
+        """
+        upper = end_id if end_id else 9_223_372_036_854_775_807
+        with self.conn:
+            cur = self.conn.execute(
+                """
+                DELETE FROM message_map WHERE group_id IN (
+                    SELECT group_id FROM message_map
+                    WHERE platform = ?
+                      AND CAST(platform_id AS INTEGER) BETWEEN ? AND ?
+                )
+                """,
+                (platform, int(start_id), int(upper)),
+            )
+        return cur.rowcount if cur.rowcount is not None else 0
 
 # ── database: avatar cache ──────────────────────────────
 
@@ -859,7 +1129,29 @@ def store_avatar_cache(db, user_id, platform: str,
                        discord_channel_id: str = None, discord_message_id: str = None,
                        stoatchat_channel_id: str = None, stoatchat_message_id: str = None):
     try:
-        existing = get_cached_avatar(db, user_id)
+        existing = get_cached_avatar(db, user_id) or {}
+        prev_hash = existing.get('avatar_hash')
+
+        # If the underlying avatar bytes changed (new hash), any previously
+        # uploaded platform CDN URLs now point to STALE bytes. Null them so
+        # each pilgrim re-uploads on next use. Without this the pilgrims'
+        # own staleness check (`age < AVATAR_REFRESH_INTERVAL`) sees the
+        # shared `last_checked` timestamp reset by this very write and
+        # concludes the URL is fresh - forever.
+        # Callers that explicitly pass a URL always win (e.g. the pilgrim
+        # writing back its just-uploaded URL).
+        hash_changed = (
+            avatar_hash is not None and prev_hash is not None
+            and avatar_hash != prev_hash
+        )
+
+        def _url_default(new_val, existing_val):
+            if new_val is not None:
+                return new_val
+            if hash_changed:
+                return None
+            return existing_val
+
         with db:
             db.execute(
                 "INSERT OR REPLACE INTO avatar_cache "
@@ -870,15 +1162,15 @@ def store_avatar_cache(db, user_id, platform: str,
                 (
                     str(user_id),
                     platform,
-                    avatar_hash if avatar_hash is not None else (existing or {}).get('avatar_hash'),
-                    avatar_bytes if avatar_bytes is not None else (existing or {}).get('avatar_bytes'),
-                    discord_url if discord_url is not None else (existing or {}).get('discord_url'),
-                    stoatchat_url if stoatchat_url is not None else (existing or {}).get('stoatchat_url'),
-                    matrix_url if matrix_url is not None else (existing or {}).get('matrix_url'),
-                    discord_channel_id if discord_channel_id is not None else (existing or {}).get('discord_channel_id'),
-                    discord_message_id if discord_message_id is not None else (existing or {}).get('discord_message_id'),
-                    stoatchat_channel_id if stoatchat_channel_id is not None else (existing or {}).get('stoatchat_channel_id'),
-                    stoatchat_message_id if stoatchat_message_id is not None else (existing or {}).get('stoatchat_message_id'),
+                    avatar_hash if avatar_hash is not None else existing.get('avatar_hash'),
+                    avatar_bytes if avatar_bytes is not None else existing.get('avatar_bytes'),
+                    _url_default(discord_url, existing.get('discord_url')),
+                    _url_default(stoatchat_url, existing.get('stoatchat_url')),
+                    _url_default(matrix_url, existing.get('matrix_url')),
+                    discord_channel_id if discord_channel_id is not None else existing.get('discord_channel_id'),
+                    discord_message_id if discord_message_id is not None else existing.get('discord_message_id'),
+                    stoatchat_channel_id if stoatchat_channel_id is not None else existing.get('stoatchat_channel_id'),
+                    stoatchat_message_id if stoatchat_message_id is not None else existing.get('stoatchat_message_id'),
                     int(time.time()),
                 )
             )
@@ -893,7 +1185,31 @@ def extract_media_urls(text):
     urls = []
     for pattern in MEDIA_URL_PATTERNS:
         urls.extend(re.findall(pattern, text, re.IGNORECASE))
+    # Extensionless direct-media redirectors (d.fixupx.com and friends). These
+    # only appear after apply_link_replacements has run, so callers must do the
+    # replacement before extracting.
+    for m in re.findall(DIRECT_MEDIA_URL_PATTERN, text, re.IGNORECASE):
+        urls.append(m.rstrip('.,;:!?'))
     return list(set(urls))
+
+
+def is_player_page_url(url: str) -> bool:
+    """True when `url` is an embeddable player page rather than a media file.
+
+    Discord hands us `embed.video.url` pointing at e.g.
+    https://www.youtube.com/embed/<id> for any oEmbed provider. Fetching that
+    yields an HTML document, which then gets written out under a .mp4 name and
+    arrives at the far end as a broken/empty file.
+    """
+    try:
+        if not url:
+            return False
+        host = (urlparse(str(url)).netloc or '').lower().split(':')[0]
+        if host.startswith('www.'):
+            host = host[4:]
+        return any(host == h or host.endswith('.' + h) for h in PLAYER_PAGE_HOSTS)
+    except Exception:
+        return False
 
 
 def extract_tenor_urls(text):
@@ -990,6 +1306,9 @@ def should_skip_download(url: str, skip_domains: list = None) -> bool:
             return False
         parsed = urlparse(url)
         host = parsed.netloc.lower()
+        # Explicit allow beats every deny below it.
+        if is_domain_downloadable(host):
+            return False
         if is_domain_ignored(host):
             return True
         if skip_domains:
@@ -1059,6 +1378,55 @@ def get_file_type_from_url(url: str, filename: str = "") -> str:
     return infer_mime_type(filename=filename, url=url, fallback='application/octet-stream')
 
 
+def attachment_name_from_download(url: str, file_path: str) -> str:
+    """Display filename for a URL we just downloaded.
+
+    Normally the URL's own basename is the best name. But extensionless
+    redirectors (d.fixupx.com and friends) give a bare post id, and only
+    `download_media` knows the real extension - it resolves one from the
+    redirect target or the Content-Type. So when the URL yields no extension,
+    fall back to the name actually written to disk, minus the cache's
+    `<epoch>_` prefix.
+    """
+    url_name = os.path.basename((url or '').split('?')[0])
+    disk_name = re.sub(r'^\d{9,}_', '', os.path.basename(file_path or ''))
+    if disk_name and (not url_name or not os.path.splitext(url_name)[1]):
+        return disk_name
+    return url_name or disk_name or f"media_{int(time.time())}"
+
+
+def ensure_filename_extension(filename: str, mime: str = "") -> str:
+    """Append a MIME-derived extension to `filename` if it lacks one.
+
+    Telegram's Bot API sometimes returns files with an internal path like
+    `documents/file_24390` with no extension. When we know the real MIME (from
+    the media object), we can restore the extension so downstream platforms
+    render inline previews instead of generic file icons.
+
+    Returns the filename unchanged if it already has an extension, or if no
+    extension can be inferred from the mime.
+    """
+    name = (filename or '').strip()
+    if not name:
+        return name
+    # Already has an extension we recognize (2-5 chars after final dot).
+    if '.' in name:
+        tail = name.rsplit('.', 1)[-1]
+        if 1 <= len(tail) <= 5 and tail.isalnum():
+            return name
+    mime = (mime or '').strip()
+    if not mime or '/' not in mime or mime == 'application/octet-stream':
+        return name
+    try:
+        import mimetypes
+        ext = mimetypes.guess_extension(mime)
+        if ext:
+            return name + ext
+    except Exception:
+        pass
+    return name
+
+
 def extract_ignore_hint_urls(text: str) -> List[str]:
     if not text:
         return []
@@ -1086,7 +1454,12 @@ def _read_line_file(path: str) -> List[str]:
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 d = line.strip()
-                if d:
+                # No entry in any of these files legitimately starts with '#'
+                # (domains, platform:id keys, privacy tuples), so treat those
+                # lines as comments rather than as bogus entries that can never
+                # match. Keeps ignored/download_domains.txt documentable, the
+                # way link_replacements.txt already is.
+                if d and not d.startswith('#'):
                     items.append(d)
         return items
     except Exception:
@@ -1462,11 +1835,20 @@ def apply_link_replacements(text: Optional[str]) -> Optional[str]:
     if not rules:
         return text
 
+    # A host that is already some rule's replacement target is left alone, so
+    # the pass is idempotent and can be run more than once on the same text.
+    # Without this, `x.com:d.fixupx.com` plus `fixupx.com:i.fixupx.com` walks a
+    # link down the chain - d.fixupx.com matches the second rule through its
+    # subdomain and a video link silently becomes an image one.
+    targets = {(dst or '').lower() for _, dst in rules}
+
     def _swap(match):
         url = match.group(0)
         try:
             parsed = urlparse(url)
             host = (parsed.netloc or '').lower()
+            if host in targets or (host.startswith('www.') and host[4:] in targets):
+                return url
             for src, dst in rules:
                 if host == src or host == 'www.' + src or host.endswith('.' + src):
                     return url.replace(parsed.netloc, dst, 1)
@@ -1485,13 +1867,29 @@ def _add_domain(path: str, domain: str) -> bool:
     return _add_line(path, domain.strip().lower())
 
 
+def _host_matches(host: str, domains) -> bool:
+    """True if `host` equals, or is a subdomain of, any entry in `domains`."""
+    host = (host or '').lower()
+    return any(host == d or host.endswith('.' + d) for d in domains)
+
+
 def is_domain_ignored(host: str) -> bool:
     try:
-        host = (host or '').lower()
-        for d in _read_domain_file(IGNORED_DOMAINS_FILE):
-            if host == d or host.endswith('.' + d):
-                return True
+        return _host_matches(host, _read_domain_file(IGNORED_DOMAINS_FILE))
+    except Exception:
         return False
+
+
+def is_domain_downloadable(host: str) -> bool:
+    """True if `host` is on the explicit download allowlist.
+
+    An entry here forces a download the policy would otherwise decline: it
+    outranks ignored_domains.txt and the automatic player-page skip. Nothing
+    unsafe can come of that, because download_media still refuses to save a
+    response that comes back as HTML.
+    """
+    try:
+        return _host_matches(host, _read_domain_file(DOWNLOAD_DOMAINS_FILE))
     except Exception:
         return False
 

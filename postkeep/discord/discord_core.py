@@ -26,6 +26,7 @@ from postkeep.papyrus import (
     is_user_ignored, add_ignored_user, is_user_admin, get_avatar_db,
     add_downloadable_domain, add_ignored_domain,
     ARBITER_QUEUES, apply_namespace, get_namespace,
+    refresh_global_privacy_limit, is_privacy_active,
     GatewayConfig, load_all_gateways,
 )
 
@@ -115,6 +116,87 @@ class DiscordCore:
 
         avatar_db_dir = os.path.join(CITADEL_ROOT, '_avatars')
         os.makedirs(avatar_db_dir, exist_ok=True)
+
+    def reload_config(self):
+        """Re-read codex.ini and the citadel gateways without restarting.
+
+        Refreshes what can be swapped safely at runtime: settings, bridges and
+        their databases, and the privacy caches. Anything baked into a live
+        object at construction - the Discord client and its library, the
+        RabbitMQ connection and its queue namespace - cannot be rebound under a
+        running bot, so a change to those is reported and left for a restart.
+        """
+        new_settings = load_global_settings(CONFIG_PATH, 'discord_bot')
+
+        # Flag settings that only take effect on a restart, so an admin isn't
+        # left believing a reload applied them.
+        restart_needed = []
+        new_mode = str(new_settings.get('DISCORD_MODE', None) or 'bot').strip().lower()
+        if new_mode in ('bot', 'clientbot') and new_mode != self.mode:
+            restart_needed.append(f"DISCORD_MODE ({self.mode} -> {new_mode})")
+        if new_settings.get('DISCORD_TOKEN') != self.settings.get('DISCORD_TOKEN'):
+            restart_needed.append('DISCORD_TOKEN')
+        new_ns = get_namespace() or str(new_settings.get('QUEUE_NAMESPACE', '')).strip()
+        if new_ns != self._namespace:
+            restart_needed.append(f"QUEUE_NAMESPACE ({self._namespace or '<none>'} -> {new_ns or '<none>'})")
+
+        self.settings = new_settings
+        self.enable_history_parsing = bool(new_settings.get('ENABLE_HISTORY_PARSING', False))
+        self.tenor_preferred_format = str(new_settings.get('TENOR_PREFERRED_FORMAT', 'gif')).lower()
+
+        try:
+            chan = new_settings.get('DISCORD_AVATAR_UPLOAD_CHANNEL_ID')
+            self.avatar_upload_channel_id = int(chan) if chan else None
+        except (TypeError, ValueError):
+            log_warn('Invalid DISCORD_AVATAR_UPLOAD_CHANNEL_ID on reload, keeping previous value',
+                     self.component_name)
+
+        new_bridges = self._build_bridges_from_gateways()
+
+        # Open databases for new bridges before publishing the new mapping, so
+        # the pilgrim thread never sees a bridge it has no database for.
+        added, removed = [], [n for n in self.bridge_dbs if n not in new_bridges]
+        for name, bridge in new_bridges.items():
+            if name in self.bridge_dbs:
+                continue
+            try:
+                os.makedirs(os.path.join(CITADEL_ROOT, name), exist_ok=True)
+                db_path = bridge.db_path
+                os.makedirs(os.path.dirname(db_path), exist_ok=True)
+                self.bridge_dbs[name] = BridgeDatabase(db_path)
+                added.append(name)
+            except Exception as e:
+                log_error(f"Could not open database for new bridge '{name}': {e}", self.component_name)
+
+        # Rebinding the dict is atomic, so the pilgrim thread reading
+        # core.bridges concurrently sees either the old or the new mapping,
+        # never a half-built one.
+        self.bridges = new_bridges
+
+        for name in removed:
+            db = self.bridge_dbs.pop(name, None)
+            try:
+                if db is not None:
+                    db.conn.close()
+            except Exception:
+                pass
+
+        refresh_global_privacy_limit()
+        privacy_active = is_privacy_active(self.bridges)
+        for ref in ('_scribe_ref', '_pilgrim_ref'):
+            target = getattr(self, ref, None)
+            if target is not None and hasattr(target, '_privacy_active'):
+                target._privacy_active = privacy_active
+
+        if added:
+            log_info(f"Bridges added on reload: {', '.join(added)}", self.component_name)
+        if removed:
+            log_warn(f"Bridges removed on reload: {', '.join(removed)}", self.component_name)
+        log_success(f"Discord config reloaded ({len(self.bridges)} bridges)")
+
+        if restart_needed:
+            log_warn('Restart required for: ' + ', '.join(restart_needed))
+        return restart_needed
 
     def _load_gateways(self) -> Dict:
         return load_all_gateways(CITADEL_ROOT)
@@ -264,6 +346,20 @@ class DiscordCore:
         url = str(url)
         return ('cdn.discordapp.com' in url) or ('media.discordapp.net' in url) or ('/attachments/' in url)
 
+    # An HTML answer from a media URL means we followed a page (a YouTube
+    # player, a link preview, a login wall) instead of a file, and saving it
+    # under a .mp4/.jpg name ships a broken attachment to the far end.
+    # Only applied to URLs we inferred; a real Discord CDN attachment is
+    # bridged whatever its type, since a user may genuinely have uploaded HTML.
+    _HTML_CONTENT_TYPES = ('text/html', 'application/xhtml+xml')
+
+    _CTYPE_EXT = {
+        'image/jpeg': '.jpg', 'image/png': '.png', 'image/gif': '.gif',
+        'image/webp': '.webp', 'video/mp4': '.mp4', 'video/webm': '.webm',
+        'video/quicktime': '.mov', 'audio/mpeg': '.mp3', 'audio/mp4': '.m4a',
+        'audio/ogg': '.ogg', 'audio/wav': '.wav',
+    }
+
     async def download_media(self, url: str, filename: Optional[str] = None, referer: Optional[str] = None) -> Optional[str]:
         cache_dir = ensure_cache_dir()
         try:
@@ -295,8 +391,34 @@ class DiscordCore:
                         log_error(f"Failed to download {url}: HTTP {resp.status}")
                         return None
 
+                    ctype = (resp.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+                    if ctype in self._HTML_CONTENT_TYPES and not self._is_discord_cdn(url):
+                        log_debug(
+                            f"Not media, refusing to save as an attachment: {url} "
+                            f"(Content-Type: {ctype})"
+                        )
+                        return None
+
+                    # Redirectors (d.fixupx.com and friends) answer on an
+                    # extensionless path and only reveal the real file after
+                    # following redirects, so name from the final URL first.
+                    final_url = str(resp.url) if resp.url else url
                     if not filename:
-                        filename = os.path.basename(url.split('?')[0]) or f"file_{int(time.time())}"
+                        filename = (os.path.basename(final_url.split('?')[0])
+                                    or os.path.basename(url.split('?')[0])
+                                    or f"file_{int(time.time())}")
+                    if not os.path.splitext(filename)[1]:
+                        ext = os.path.splitext(final_url.split('?')[0])[1]
+                        if not ext and ctype:
+                            ext = self._CTYPE_EXT.get(ctype) or ''
+                            if not ext:
+                                try:
+                                    import mimetypes
+                                    ext = mimetypes.guess_extension(ctype) or ''
+                                except Exception:
+                                    ext = ''
+                        if ext:
+                            filename = f"{filename}{ext}"
 
                     file_path = os.path.join(cache_dir, f"{int(time.time())}_{filename}")
 
@@ -429,12 +551,108 @@ class DiscordCore:
             pass
         return None
 
+    # ── asyncio loop safety net ─────────────────────────────
+
+    # CPython 3.12+ nulls _SelectorSocketTransport._read_ready_cb in
+    # _call_connection_lost() to break a reference cycle. If the fd's reader is
+    # still registered with the selector at that point (fd closed and reused
+    # underneath us, or remove_reader didn't take), the selector keeps reporting
+    # the fd readable forever: _read_ready() -> self._read_ready_cb() ->
+    # TypeError: 'NoneType' object is not callable -> logged -> repeat, at full
+    # CPU. Nothing in asyncio ever unregisters it, so it spins until restart.
+    #
+    # We recognise that exact signature, rip the stale reader out of the
+    # selector ourselves (which stops it for good), and only fall back to
+    # exiting - so the arbiter restarts us - if the heal doesn't hold.
+
+    _RUNAWAY_WINDOW = 30.0      # seconds
+    _RUNAWAY_LIMIT = 50         # heal attempts in that window before we bail
+
+    def _install_loop_exception_handler(self, loop):
+        state = {'start': 0.0, 'count': 0, 'logged': False}
+        default = loop.get_exception_handler()
+
+        def handler(lp, context):
+            try:
+                if self._try_heal_dead_reader(lp, context, state):
+                    return
+            except Exception:
+                pass
+            if default is not None:
+                default(lp, context)
+            else:
+                lp.default_exception_handler(context)
+
+        loop.set_exception_handler(handler)
+        log_debug('Installed asyncio exception handler (dead-reader guard)')
+
+    def _try_heal_dead_reader(self, loop, context, state) -> bool:
+        """Return True if this was the runaway dead-reader callback and we handled it."""
+        exc = context.get('exception')
+        if not isinstance(exc, TypeError):
+            return False
+        if 'NoneType' not in str(exc) or 'not callable' not in str(exc):
+            return False
+
+        handle = context.get('handle')
+        callback = getattr(handle, '_callback', None)
+        transport = getattr(callback, '__self__', None)
+        if transport is None or getattr(callback, '__name__', '') != '_read_ready':
+            return False
+
+        now = time.time()
+        if now - state['start'] > self._RUNAWAY_WINDOW:
+            state.update(start=now, count=0, logged=False)
+        state['count'] += 1
+
+        fd = getattr(transport, '_sock_fd', None)
+        removed = False
+        if fd is not None and fd >= 0:
+            try:
+                loop._remove_reader(fd)
+                removed = True
+            except Exception:
+                removed = False
+        try:
+            transport.abort()
+        except Exception:
+            pass
+
+        if not state['logged']:
+            state['logged'] = True
+            log_warn(
+                f"asyncio dead-reader storm on fd={fd}: transport read callback was "
+                f"cleared while still registered with the selector. "
+                f"{'Unregistered it' if removed else 'Could not unregister it'}; "
+                f"suppressing repeats for {int(self._RUNAWAY_WINDOW)}s."
+            )
+
+        if state['count'] >= self._RUNAWAY_LIMIT:
+            log_error(
+                f"asyncio dead-reader storm did not clear after {state['count']} "
+                f"heal attempts in {int(self._RUNAWAY_WINDOW)}s; exiting so the "
+                f"arbiter restarts this component."
+            )
+            try:
+                self.send_status_update('error', 'asyncio dead-reader storm')
+            except Exception:
+                pass
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(70)
+
+        return True
+
     # ── run ─────────────────────────────────────────────
 
     async def run(self):
         self.send_status_update('starting')
 
         loop = asyncio.get_running_loop()
+        self._install_loop_exception_handler(loop)
         if hasattr(self, '_pilgrim_ref') and self._pilgrim_ref:
             self._pilgrim_ref._loop = loop
 
