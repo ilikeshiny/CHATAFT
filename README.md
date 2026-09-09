@@ -43,6 +43,7 @@ Arbiter Live Dashboard Preview
 - imports now self-disable themselves when done to avoid confusion
 - fixed link replacements to be handled post-transform on discord's side
 - sooo many fixes for DB storage cleanups, message mapping deduplications, extended matrix compatibility and many many other little things <br>
+</details>
 
 this update tackles many issues because i'm not using git repositories as intended and instead upload bulk updates i've been working on for months, so these "1.1, 1.2" actually matter
 
