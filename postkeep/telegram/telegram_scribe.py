@@ -35,6 +35,41 @@ def _norm_text(s: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
+# Telegram dice: emoji -> (phrase, highest value). The value is the face the
+# animation lands on.
+_DICE_PHRASES = {
+    '🎲': ('Rolled the 🎲 dice', 6),
+    '🎯': ('Threw a 🎯 dart', 6),
+    '🏀': ('Shot a 🏀 basketball', 5),
+    '⚽': ('Kicked a ⚽ football', 5),
+    '🎳': ('Bowled 🎳', 6),
+}
+
+# The slot machine packs three reels into its 1-64 value: subtract one and
+# each reel is a 2-bit index into this list. Lowest bits taken as the left
+# reel. Three-of-a-kinds (1, 22, 43, 64) read the same either way; if mixed
+# results come out mirrored against the animation, reverse `reels` below.
+_SLOT_SYMBOLS = ('BAR', '🍇', '🍋', '7️⃣')
+
+
+def describe_dice_roll(emoji, value) -> str:
+    emoji = emoji or '🎲'
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return emoji
+
+    if emoji == '🎰':
+        n = value - 1
+        if not 0 <= n < 64:
+            return f"Spun the 🎰 slot machine and got {value}"
+        reels = [_SLOT_SYMBOLS[(n >> shift) & 3] for shift in (0, 2, 4)]
+        return f"Spun the 🎰 slot machine and got {' '.join(reels)}"
+
+    phrase, top = _DICE_PHRASES.get(emoji, (f"Rolled {emoji}", None))
+    return f"{phrase} and got {value}/{top}" if top else f"{phrase} and got {value}"
+
+
 class TelegramScribe:
     def __init__(self, core: 'TelegramCore'):
         self.core = core
@@ -1021,6 +1056,14 @@ class TelegramScribe:
                             message._extra_captions.append(extra_caption)
 
             text_content = message.text or message.caption or ''
+            # Dice messages (🎲 🎯 🏀 ⚽ 🎳 🎰) are animated rolls with no text,
+            # caption or media, so they used to publish an empty message that
+            # Discord rejects. Describe the roll in plain text instead.
+            dice = getattr(message, 'dice', None)
+            if dice is not None and not text_content:
+                text_content = describe_dice_roll(
+                    getattr(dice, 'emoji', None), getattr(dice, 'value', None)
+                )
             text_entities = message.entities if message.text else (
                 message.caption_entities if message.caption else None
             )

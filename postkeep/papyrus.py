@@ -1193,6 +1193,46 @@ def extract_media_urls(text):
     return list(set(urls))
 
 
+def is_direct_media_url(url: str) -> bool:
+    """True for URLs on the extensionless redirector hosts in DIRECT_MEDIA_HOSTS."""
+    try:
+        host = (urlparse(str(url)).netloc or '').lower().split(':')[0]
+        return host in DIRECT_MEDIA_HOSTS
+    except Exception:
+        return False
+
+
+# Path segments that are followed by the post's own id on the sites the
+# redirectors mirror: twitter/x `status/<id>`, tiktok `video/<id>`, instagram
+# `p|reel|tv/<code>`, reddit `comments/<id>`.
+_POST_ID_MARKERS = {
+    'status': 'status', 'statuses': 'status',
+    'video': 'video',
+    'p': 'ig', 'reel': 'ig', 'reels': 'ig', 'tv': 'ig',
+    'comments': 'comments',
+}
+
+
+def media_post_key(url: str) -> Optional[str]:
+    """Identify the post a URL points at, whichever host serves it.
+
+    d.fixupx.com/u/status/1, x.com/u/status/1 and twitter.com/i/status/1 are
+    the same post, and the redirectors keep the original site's path. Used to
+    spot that Discord's embed already delivered a post's media, so we don't
+    fetch it a second time through the redirector link.
+    """
+    try:
+        path = (urlparse(str(url)).path or '').lower()
+        segs = [seg for seg in path.split('/') if seg]
+        for i, seg in enumerate(segs[:-1]):
+            kind = _POST_ID_MARKERS.get(seg)
+            if kind:
+                return f"{kind}:{segs[i + 1]}"
+        return None
+    except Exception:
+        return None
+
+
 def is_player_page_url(url: str) -> bool:
     """True when `url` is an embeddable player page rather than a media file.
 

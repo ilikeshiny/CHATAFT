@@ -15,6 +15,7 @@ from postkeep.papyrus import (
     BridgeMessage,
     extract_media_urls, extract_tenor_urls, escape_discord_emojis,
     is_player_page_url, is_domain_downloadable,
+    is_direct_media_url, media_post_key,
     convert_video_to_gif, get_file_type_from_url,
     attachment_name_from_download, normalize_mime_type,
     should_skip_download, extract_ignore_hint_urls,
@@ -832,6 +833,25 @@ class DiscordScribe:
         return None
 
     @staticmethod
+    def _post_already_attached(url: str, attachments: List[Dict]) -> bool:
+        """True if `url` is a redirector link to a post whose media is already attached.
+
+        Discord's embed for a fixupx link reports the original x.com page, not
+        the d.fixupx.com one, so a plain URL comparison misses that both are the
+        same post and the video gets downloaded twice. Compare by post id.
+        """
+        if not is_direct_media_url(url):
+            return False
+        key = media_post_key(url)
+        if not key:
+            return False
+        for att in attachments:
+            for field in ('page_url', 'url'):
+                if att.get(field) and media_post_key(att[field]) == key:
+                    return True
+        return False
+
+    @staticmethod
     def _unwrap_external_url(url: str) -> str:
         try:
             if url and '/external/' in url and ('discordapp.net' in url or 'discordapp.com' in url):
@@ -1261,7 +1281,8 @@ class DiscordScribe:
                                     if fp:
                                         fname = os.path.basename(referer.split('?')[0]) or f"media_{int(time.time())}"
                                         ftype = get_file_type_from_url(referer, fname)
-                                        attachments.append({'url': referer, 'filename': fname, 'type': ftype, 'local_path': fp})
+                                        attachments.append({'url': referer, 'filename': fname, 'type': ftype, 'local_path': fp,
+                                                            'page_url': getattr(e, 'url', None)})
                                         consumed_urls.append(referer)
                         except Exception:
                             continue
@@ -1293,6 +1314,9 @@ class DiscordScribe:
                         for url in fresh_media_urls:
                             if url in seen_urls:
                                 continue
+                            if self._post_already_attached(url, attachments):
+                                log_debug(f"Skipping redirector download, post already attached from embed: {url}")
+                                continue
                             is_discord_cdn_text = any(domain in url for domain in ['cdn.discordapp.com', 'media.discordapp.net', '/attachments/'])
                             if is_discord_cdn_text:
                                 file_path = await self.core.download_with_recovery(url, None, message=fresh)
@@ -1307,7 +1331,7 @@ class DiscordScribe:
                                 continue
                             file_path = await self.core.download_media(url)
                             if file_path:
-                                filename = os.path.basename(url.split('?')[0]) or f"media_{int(time.time())}"
+                                filename = attachment_name_from_download(url, file_path)
                                 file_type = get_file_type_from_url(url, filename)
                                 attachments.append({'url': url, 'filename': filename, 'type': file_type, 'local_path': file_path})
                                 seen_urls.add(url)
@@ -1324,6 +1348,11 @@ class DiscordScribe:
         failed_downloads = 0
         for url in media_urls:
             if url in seen_urls:
+                continue
+            if self._post_already_attached(url, attachments):
+                # The link is still in media_urls, so it's stripped from the
+                # text below like any other delivered media.
+                log_debug(f"Skipping redirector download, post already attached from embed: {url}")
                 continue
             if url in ignored_hint_urls:
                 skipped_links.append(url)
